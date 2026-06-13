@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
 from pyspark.sql.types import (
     BooleanType,
     DateType,
@@ -183,3 +185,76 @@ EVENTS_SCHEMA = StructType(
         StructField("genai_tokens", LongType()),
     ]
 )
+
+
+# --------------------------------------------------------------------------- #
+# Silver pure transforms (issue #5) — DataFrame -> DataFrame, no I/O, so they
+# are unit-testable with small in-memory DataFrames.
+# --------------------------------------------------------------------------- #
+
+# Org master attributes attached to each event during enrichment.
+ORG_ENRICH_COLS = ["org_name", "plan_tier", "industry", "hq_region"]
+
+# Default negative-cost threshold for the DQ flag (rule R2).
+NEG_COST_THRESHOLD = -0.01
+
+
+def conform_and_enrich(events: DataFrame, orgs: DataFrame) -> DataFrame:
+    """Conform v1/v2 events, derive features, and enrich with org attributes.
+
+    - ``event_date`` derived from the event timestamp.
+    - ``genai_tokens`` coalesced to 0 (null = not reported / non-genai; 0 is the
+      additive identity for summing).
+    - ``carbon_kg`` kept as-is (null for v1 — not fabricated).
+    - Features: ``cost_usd``, ``genai_tokens``, ``carbon_kg``, ``requests``.
+    - Broadcast LEFT join to the org master so events with an unknown ``org_id``
+      survive with null org attributes.
+    """
+    enriched = (
+        events.withColumn("event_date", F.to_date("timestamp"))
+        .withColumn("genai_tokens", F.coalesce(F.col("genai_tokens"), F.lit(0)))
+        .withColumn("cost_usd", F.col("cost_usd_increment"))
+        .withColumn("requests", F.when(F.col("metric") == "requests", F.col("value")))
+    )
+    orgs_dim = orgs.select("org_id", *ORG_ENRICH_COLS)
+    return enriched.join(F.broadcast(orgs_dim), on="org_id", how="left")
+
+
+def apply_dq_rules(df: DataFrame) -> tuple[DataFrame, DataFrame]:
+    """Split rows into (clean, quarantine) by the 3 active data-quality rules.
+
+    - R1: ``event_id`` null -> quarantine (structurally broken).
+    - R3: ``value`` present but ``unit`` null -> quarantine (unit-inconsistent).
+    - R2 (negative cost) is NOT a quarantine rule: those rows are kept and
+      flagged downstream by :func:`flag_cost_anomalies`.
+
+    Quarantined rows carry a ``dq_rule`` reason column for inspectable samples.
+    """
+    reason = F.when(F.col("event_id").isNull(), F.lit("event_id_null")).when(
+        F.col("value").isNotNull() & F.col("unit").isNull(),
+        F.lit("unit_missing_with_value"),
+    )
+    tagged = df.withColumn("dq_rule", reason)
+    quarantine = tagged.filter(F.col("dq_rule").isNotNull())
+    clean = tagged.filter(F.col("dq_rule").isNull()).drop("dq_rule")
+    return clean, quarantine
+
+
+def flag_cost_anomalies(
+    df: DataFrame, neg_threshold: float = NEG_COST_THRESHOLD
+) -> DataFrame:
+    """Add ``cost_anomaly_flag``: negative cost (R2) OR per-service p01/p99 outlier."""
+    stats = df.groupBy("service").agg(
+        F.percentile_approx("cost_usd", 0.01).alias("_p01"),
+        F.percentile_approx("cost_usd", 0.99).alias("_p99"),
+    )
+    return (
+        df.join(F.broadcast(stats), on="service", how="left")
+        .withColumn(
+            "cost_anomaly_flag",
+            (F.col("cost_usd_increment") < F.lit(neg_threshold))
+            | (F.col("cost_usd") < F.col("_p01"))
+            | (F.col("cost_usd") > F.col("_p99")),
+        )
+        .drop("_p01", "_p99")
+    )

@@ -158,33 +158,51 @@ bronze_events_count = spark.read.parquet(str(BRONZE / "usage_events")).count()
 print("bronze events rows:", bronze_events_count)
 
 # %% [markdown]
-# ## Silver — minimal enrichment join
+# ## Silver — conformance, enrichment, data quality, anomaly flags
 #
-# Broadcast LEFT join events to the org master (events with an unknown org
-# survive with null attributes). Full conformance / DQ / quarantine / anomaly is
-# issue #5.
+# Pure transforms from `cpa`:
+# 1. `conform_and_enrich` — v1/v2 conformance, features, broadcast LEFT join to
+#    the org master.
+# 2. `apply_dq_rules` — split clean vs quarantine (R1 event_id null, R3 value
+#    without unit); negative cost (R2) is kept and flagged, not quarantined.
+# 3. `flag_cost_anomalies` — `cost_anomaly_flag` from negative cost OR per-service
+#    p01/p99 outliers.
+#
+# Quarantined rows (with a `dq_rule` reason) go to a separate zone for samples.
 
 # %%
 events_b = spark.read.parquet(str(BRONZE / "usage_events"))
 orgs_b = spark.read.parquet(str(BRONZE / "masters" / "customers_orgs"))
 
-silver = (
-    events_b.join(
-        F.broadcast(
-            orgs_b.select("org_id", "org_name", "plan_tier", "industry", "hq_region")
-        ),
-        on="org_id",
-        how="left",
-    )
-    .withColumnRenamed("date", "event_date")
-    .withColumn("cost_usd", F.col("cost_usd_increment"))
-)
+enriched = cpa.conform_and_enrich(events_b, orgs_b)
+clean, quarantine = cpa.apply_dq_rules(enriched)
+silver = cpa.flag_cost_anomalies(clean)
+
 (
     silver.write.mode("overwrite")
     .partitionBy("event_date")
     .parquet(str(SILVER / "usage_events_enriched"))
 )
-print("silver rows:", silver.count())
+(
+    quarantine.write.mode("overwrite")
+    .partitionBy("event_date")
+    .parquet(str(QUARANTINE / "usage_events"))
+)
+
+silver_count = spark.read.parquet(str(SILVER / "usage_events_enriched")).count()
+q_df = spark.read.parquet(str(QUARANTINE / "usage_events"))
+quarantine_count = q_df.count()
+anomaly_count = (
+    spark.read.parquet(str(SILVER / "usage_events_enriched"))
+    .filter(F.col("cost_anomaly_flag"))
+    .count()
+)
+print("silver rows:", silver_count)
+print("quarantine rows:", quarantine_count)
+if quarantine_count:
+    print("  quarantine reasons:")
+    q_df.groupBy("dq_rule").count().show(truncate=False)
+print("cost anomaly flagged rows:", anomaly_count)
 
 # %% [markdown]
 # ## Gold — minimal FinOps mart (cost only)
