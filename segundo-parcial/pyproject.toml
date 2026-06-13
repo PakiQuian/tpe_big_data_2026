@@ -3,7 +3,13 @@ name = "segundo-parcial"
 version = "0.1.0"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "cassandra-driver>=3.30.0",
     "jupytext>=1.19.3",
     "pyspark==4.0.*",
     "ruff>=0.15.17",
 ]
+
+[tool.ruff]
+# pipeline.py is a jupytext "percent" notebook: imports live inside cells,
+# so E402 (module import not at top of file) does not apply.
+lint.per-file-ignores = { "pipeline.py" = ["E402"] }
