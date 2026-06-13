@@ -258,3 +258,50 @@ def flag_cost_anomalies(
         )
         .drop("_p01", "_p99")
     )
+
+
+# --------------------------------------------------------------------------- #
+# Gold pure transforms (issue #6) — FinOps mart + 14-day rollup.
+# --------------------------------------------------------------------------- #
+
+# Trailing window (days) for the top-N-services-by-cost serving query.
+COST_ROLLUP_DAYS = 14
+
+
+def build_gold_daily(silver: DataFrame) -> DataFrame:
+    """FinOps mart `org_daily_usage_by_service`: grain org x service x day.
+
+    Measures summed across regions; `has_anomaly` is true if any event in the
+    group was flagged. Org dimensions are carried for serving.
+    """
+    return silver.groupBy("org_id", "service", "event_date").agg(
+        F.sum("cost_usd").alias("cost_usd"),
+        F.sum("requests").alias("requests"),
+        F.sum("genai_tokens").alias("genai_tokens"),
+        F.sum("carbon_kg").alias("carbon_kg"),
+        F.count(F.lit(1)).alias("event_count"),
+        F.max("cost_anomaly_flag").alias("has_anomaly"),
+        F.first("org_name", ignorenulls=True).alias("org_name"),
+        F.first("plan_tier", ignorenulls=True).alias("plan_tier"),
+        F.first("industry", ignorenulls=True).alias("industry"),
+        F.first("hq_region", ignorenulls=True).alias("hq_region"),
+    )
+
+
+def build_cost_14d(
+    gold_daily: DataFrame, as_of_date, window_days: int = COST_ROLLUP_DAYS
+) -> DataFrame:
+    """Per org x service cost summed over the trailing `window_days` ending at
+    `as_of_date` (a datetime.date). Pre-aggregation for the top-N serving query.
+    """
+    import datetime as _dt
+
+    start = as_of_date - _dt.timedelta(days=window_days - 1)
+    windowed = gold_daily.filter(
+        (F.col("event_date") >= F.lit(start))
+        & (F.col("event_date") <= F.lit(as_of_date))
+    )
+    return windowed.groupBy("org_id", "service").agg(
+        F.sum("cost_usd").alias("total_cost_usd"),
+        F.first("org_name", ignorenulls=True).alias("org_name"),
+    )

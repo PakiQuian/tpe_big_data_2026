@@ -205,25 +205,33 @@ if quarantine_count:
 print("cost anomaly flagged rows:", anomaly_count)
 
 # %% [markdown]
-# ## Gold — minimal FinOps mart (cost only)
+# ## Gold — FinOps mart + 14-day cost rollup
 #
-# Grain org × service × day. Full measure set (requests, genai_tokens, carbon_kg,
-# has_anomaly) + the 14-day rollup is issue #6.
+# `build_gold_daily` → `org_daily_usage_by_service` (grain org × service × day,
+# all measures + `has_anomaly`). `build_cost_14d` → `org_service_cost_14d`, the
+# trailing-14-day per-org/service cost rollup that powers the top-N serving query
+# (#7). The window ends at the latest event date in the mart.
 
 # %%
 silver_g = spark.read.parquet(str(SILVER / "usage_events_enriched"))
-gold = silver_g.groupBy("org_id", "service", "event_date").agg(
-    F.sum("cost_usd").alias("cost_usd"),
-    F.first("org_name", ignorenulls=True).alias("org_name"),
-    F.first("plan_tier", ignorenulls=True).alias("plan_tier"),
-)
+
+gold_daily = cpa.build_gold_daily(silver_g)
 (
-    gold.write.mode("overwrite")
+    gold_daily.write.mode("overwrite")
     .partitionBy("event_date")
     .parquet(str(GOLD / "org_daily_usage_by_service"))
 )
-gold_rows = gold.collect()
+gold_daily = spark.read.parquet(str(GOLD / "org_daily_usage_by_service"))
+
+as_of_date = gold_daily.agg(F.max("event_date")).collect()[0][0]
+cost_14d = cpa.build_cost_14d(gold_daily, as_of_date)
+(cost_14d.write.mode("overwrite").parquet(str(GOLD / "org_service_cost_14d")))
+
+gold_rows = gold_daily.collect()
 print("gold rows:", len(gold_rows))
+print(
+    f"14d rollup ({as_of_date}): {cost_14d.count()} org/service rows",
+)
 
 # %% [markdown]
 # ## Serving — Cassandra (Docker for dev, AstraDB for final evidence)
