@@ -1,0 +1,17 @@
+# data lake: keep only landing (source data) under version control if desired,
+# ignore generated zones + spark/streaming artifacts
+datalake/bronze/
+datalake/silver/
+datalake/gold/
+datalake/checkpoints/
+datalake/quarantine/
+
+# python / uv
+.venv/
+__pycache__/
+*.pyc
+
+# spark
+spark-warehouse/
+metastore_db/
+derby.log

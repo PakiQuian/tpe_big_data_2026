@@ -1,0 +1,9 @@
+[project]
+name = "segundo-parcial"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "jupytext>=1.19.3",
+    "pyspark==4.0.*",
+    "ruff>=0.15.17",
+]
