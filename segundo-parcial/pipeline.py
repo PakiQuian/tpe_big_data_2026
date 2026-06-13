@@ -6,10 +6,12 @@
 # Built incrementally as vertical slices:
 # - #2 tracer bullet — the full spine, minimal at every layer.
 # - #3 Bronze masters — all 7 CSV masters via the `cpa.MASTERS` registry.
+# - #4 Bronze streaming — usage events via Structured Streaming (watermark,
+#   dedup, checkpoint).
 #
-# Still minimal downstream (batch event read; single-measure Gold; one Cassandra
-# table; query #1). Structured Streaming (#4), full Silver (#5), full Gold (#6),
-# the 2nd serving table (#7), and evidence/artifacts (#8) come next.
+# Still minimal downstream (single-measure Gold; one Cassandra table; query #1).
+# Full Silver (#5), full Gold + 14d rollup (#6), the 2nd serving table + query #2
+# (#7), and evidence/artifacts (#8) come next.
 
 # %% [markdown]
 # ## Configuration
@@ -111,26 +113,49 @@ for name, spec in cpa.MASTERS.items():
     print(f"bronze master {name:<18} rows: {n}")
 
 # %% [markdown]
-# ## Bronze — usage events via a PLAIN BATCH read
+# ## Bronze — usage events via Structured Streaming
 #
-# Explicit superset schema (`cpa.EVENTS_SCHEMA`, v1 ∪ v2) so v1 rows get null
-# `carbon_kg`/`genai_tokens` and `value` is typed as double (Spark otherwise
-# infers it as string). Dedupe by `event_id`, partition by event `date`.
-# Structured Streaming replaces this read in issue #4.
+# Reads `usage_events_stream/*.jsonl` as a stream with the explicit superset
+# schema (`cpa.EVENTS_SCHEMA`, v1 ∪ v2). Key behaviors:
+#
+# - **Watermark = 60 days** on event time. The files arrive in arbitrary
+#   timestamp order, so a tight watermark would mark whole out-of-order files as
+#   "late" and silently drop them. Sizing it to the historical replay span keeps
+#   every event while still bounding dedup state. (Production with real-time
+#   arrival would use minutes — see DECISIONS.md.)
+# - **Dedup by `event_id`** via `dropDuplicatesWithinWatermark`, defending
+#   against re-delivery / reprocessing.
+# - **`maxFilesPerTrigger=4` + `availableNow` trigger**: chunks the 120 files
+#   into many micro-batches and then stops on its own, so the notebook runs
+#   top-to-bottom and terminates.
+# - **Checkpointing**: offsets + dedup state under `checkpoints/`. Re-running
+#   resumes from committed offsets (no reprocessing) — the idempotency story.
+#
+# Bronze stays permissive; data-quality rules + quarantine live in Silver (#5).
 
 # %%
-events_bronze = (
-    spark.read.schema(cpa.EVENTS_SCHEMA)
+events_stream = (
+    spark.readStream.schema(cpa.EVENTS_SCHEMA)
+    .option("maxFilesPerTrigger", 4)
     .json(str(LANDING / "usage_events_stream"))
-    .dropDuplicates(["event_id"])
     .withColumn("date", F.to_date("timestamp"))
+    .withWatermark("timestamp", "60 days")
+    .dropDuplicatesWithinWatermark(["event_id"])
 )
-(
-    events_bronze.write.mode("overwrite")
+
+events_query = (
+    events_stream.writeStream.format("parquet")
+    .option("path", str(BRONZE / "usage_events"))
+    .option("checkpointLocation", str(CHECKPOINTS / "usage_events_bronze"))
     .partitionBy("date")
-    .parquet(str(BRONZE / "usage_events"))
+    .outputMode("append")
+    .trigger(availableNow=True)
+    .start()
 )
-print("bronze events rows:", events_bronze.count())
+events_query.awaitTermination()
+
+bronze_events_count = spark.read.parquet(str(BRONZE / "usage_events")).count()
+print("bronze events rows:", bronze_events_count)
 
 # %% [markdown]
 # ## Silver — minimal enrichment join
