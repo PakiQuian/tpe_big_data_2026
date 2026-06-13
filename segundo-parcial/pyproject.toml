@@ -13,3 +13,12 @@ dependencies = [
 # pipeline.py is a jupytext "percent" notebook: imports live inside cells,
 # so E402 (module import not at top of file) does not apply.
 lint.per-file-ignores = { "pipeline.py" = ["E402"] }
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.0",
+]

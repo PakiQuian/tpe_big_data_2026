@@ -1,13 +1,15 @@
 # %% [markdown]
 # # Cloud Provider Analytics — End-to-End MVP (Segundo Parcial)
 #
-# **Tracer bullet (issue #2):** thinnest end-to-end path that proves the whole
-# spine — landing → Bronze → Silver → Gold → Serving (Cassandra) — and de-risks
-# the Spark 4.0 + `cassandra-driver` + Docker integration.
+# End-to-end pipeline: landing → Bronze → Silver → Gold → Serving (Cassandra).
 #
-# Scope is intentionally minimal: one master, a *batch* event read (real
-# Structured Streaming arrives in #4), a single-measure Gold mart, one Cassandra
-# table, and business query #1. Feature depth comes in the later slices.
+# Built incrementally as vertical slices:
+# - #2 tracer bullet — the full spine, minimal at every layer.
+# - #3 Bronze masters — all 7 CSV masters via the `cpa.MASTERS` registry.
+#
+# Still minimal downstream (batch event read; single-measure Gold; one Cassandra
+# table; query #1). Structured Streaming (#4), full Silver (#5), full Gold (#6),
+# the 2nd serving table (#7), and evidence/artifacts (#8) come next.
 
 # %% [markdown]
 # ## Configuration
@@ -70,88 +72,55 @@ spark.sparkContext.setLogLevel("WARN")
 print("Spark", spark.version)
 
 # %%
+import cpa
 from pyspark.sql import functions as F
-from pyspark.sql.types import (
-    BooleanType,
-    DateType,
-    DoubleType,
-    IntegerType,
-    LongType,
-    StringType,
-    StructField,
-    StructType,
-    TimestampType,
-)
 
 # %% [markdown]
-# ## Bronze — ingest the `customers_orgs` master
+# ## Bronze — ingest all 7 masters (parameterized loop)
 #
-# Explicit schema (no inference), dedupe on the natural key, technical columns
-# (`ingest_ts`, `source_file`), partitioned by `ingest_date` with overwrite so a
-# same-day re-run is idempotent. The full 7-master loop is issue #3.
+# Each master is read with an explicit schema from the `cpa.MASTERS` registry (no
+# inference), deduped on its natural key, stamped with technical columns
+# (`ingest_ts`, `source_file`), and written partitioned by `ingest_date` with
+# overwrite so a same-day re-run is idempotent. `escape='"'` handles the embedded
+# JSON in `resources.tags_json`.
+
 
 # %%
-customers_orgs_schema = StructType(
-    [
-        StructField("org_id", StringType()),
-        StructField("org_name", StringType()),
-        StructField("industry", StringType()),
-        StructField("hq_region", StringType()),
-        StructField("plan_tier", StringType()),
-        StructField("is_enterprise", BooleanType()),
-        StructField("signup_date", DateType()),
-        StructField("sales_rep", StringType()),
-        StructField("lifecycle_stage", StringType()),
-        StructField("marketing_source", StringType()),
-        StructField("nps_score", DoubleType()),
-    ]
-)
+def ingest_master(spec: "cpa.MasterSpec"):
+    """Read one master CSV → typed, deduped Bronze Parquet partitioned by ingest_date."""
+    df = (
+        spark.read.option("header", True)
+        .option("escape", '"')
+        .schema(spec.schema)
+        .csv(str(LANDING / spec.filename))
+        .dropDuplicates(spec.dedupe_keys)
+        .withColumn("ingest_ts", F.current_timestamp())
+        .withColumn("source_file", F.input_file_name())
+        .withColumn("ingest_date", F.current_date())
+    )
+    (
+        df.write.mode("overwrite")
+        .partitionBy("ingest_date")
+        .parquet(str(BRONZE / "masters" / spec.name))
+    )
+    return df.count()
 
-orgs_bronze = (
-    spark.read.option("header", True)
-    .schema(customers_orgs_schema)
-    .csv(str(LANDING / "customers_orgs.csv"))
-    .dropDuplicates(["org_id"])
-    .withColumn("ingest_ts", F.current_timestamp())
-    .withColumn("source_file", F.input_file_name())
-    .withColumn("ingest_date", F.current_date())
-)
-(
-    orgs_bronze.write.mode("overwrite")
-    .partitionBy("ingest_date")
-    .parquet(str(BRONZE / "masters" / "customers_orgs"))
-)
-print("bronze customers_orgs rows:", orgs_bronze.count())
+
+for name, spec in cpa.MASTERS.items():
+    n = ingest_master(spec)
+    print(f"bronze master {name:<18} rows: {n}")
 
 # %% [markdown]
 # ## Bronze — usage events via a PLAIN BATCH read
 #
-# Explicit superset schema (v1 ∪ v2) so v1 rows get null `carbon_kg`/`genai_tokens`
-# and `value` is typed as double (Spark otherwise infers it as string). Dedupe by
-# `event_id`, partition by event `date`. Structured Streaming replaces this read
-# in issue #4.
+# Explicit superset schema (`cpa.EVENTS_SCHEMA`, v1 ∪ v2) so v1 rows get null
+# `carbon_kg`/`genai_tokens` and `value` is typed as double (Spark otherwise
+# infers it as string). Dedupe by `event_id`, partition by event `date`.
+# Structured Streaming replaces this read in issue #4.
 
 # %%
-events_schema = StructType(
-    [
-        StructField("event_id", StringType()),
-        StructField("timestamp", TimestampType()),
-        StructField("org_id", StringType()),
-        StructField("resource_id", StringType()),
-        StructField("service", StringType()),
-        StructField("region", StringType()),
-        StructField("metric", StringType()),
-        StructField("value", DoubleType()),
-        StructField("unit", StringType()),
-        StructField("cost_usd_increment", DoubleType()),
-        StructField("schema_version", IntegerType()),
-        StructField("carbon_kg", DoubleType()),
-        StructField("genai_tokens", LongType()),
-    ]
-)
-
 events_bronze = (
-    spark.read.schema(events_schema)
+    spark.read.schema(cpa.EVENTS_SCHEMA)
     .json(str(LANDING / "usage_events_stream"))
     .dropDuplicates(["event_id"])
     .withColumn("date", F.to_date("timestamp"))
@@ -309,5 +278,5 @@ for row in q1_rows[:15]:
 cluster.shutdown()
 spark.stop()
 print(
-    "\nTracer bullet complete: landing -> Bronze -> Silver -> Gold -> Cassandra -> query #1 OK"
+    "\nPipeline run complete: landing -> Bronze -> Silver -> Gold -> Cassandra -> query #1 OK"
 )
