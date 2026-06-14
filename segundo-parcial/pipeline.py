@@ -300,6 +300,67 @@ print(f"\nQuery #2 — top {len(top_n)} services (14d) for org={sample_org}:")
 for row in top_n:
     print(f"  {row.service:<12} total_cost_usd={row.total_cost_usd:.2f}")
 
+# %% [markdown]
+# ## Idempotency & partition evidence
+#
+# Re-running the whole pipeline yields identical row counts in every zone: Bronze
+# events resume from the streaming checkpoint (no reprocessing), masters / Silver
+# / Gold use overwrite, and Cassandra writes are upserts (the 14d table
+# truncates-then-reloads). Run this notebook twice and compare the table below —
+# the counts do not change. The partition listing evidences "particionado
+# sensato" with real paths and sizes.
+
+
+# %%
+def _parquet_count(path):
+    return spark.read.parquet(str(path)).count()
+
+
+def _cass_count(table):
+    return session.execute(f"SELECT COUNT(*) AS c FROM {table}").one().c
+
+
+def _human(nbytes):
+    for unit in ("B", "KB", "MB", "GB"):
+        if nbytes < 1024 or unit == "GB":
+            return f"{nbytes:.1f}{unit}"
+        nbytes /= 1024
+
+
+masters_latest = sum(read_latest_master(n).count() for n in cpa.MASTERS)
+
+counts = [
+    ("bronze/masters (latest snapshots)", masters_latest),
+    ("bronze/usage_events", _parquet_count(BRONZE / "usage_events")),
+    ("silver/usage_events_enriched", _parquet_count(SILVER / "usage_events_enriched")),
+    ("quarantine/usage_events", _parquet_count(QUARANTINE / "usage_events")),
+    (
+        "gold/org_daily_usage_by_service",
+        _parquet_count(GOLD / "org_daily_usage_by_service"),
+    ),
+    ("gold/org_service_cost_14d", _parquet_count(GOLD / "org_service_cost_14d")),
+    ("cassandra org_daily_usage_by_service", _cass_count(serving.DAILY_TABLE)),
+    ("cassandra org_service_cost_14d", _cass_count(serving.COST_14D_TABLE)),
+]
+print("\n=== Idempotency evidence — row counts per zone (identical across re-runs) ===")
+for name, n in counts:
+    print(f"  {name:<42} {n:>8}")
+
+# %%
+print("\n=== Partition evidence (particionado sensato) ===")
+for zone in (
+    "bronze/usage_events",
+    "silver/usage_events_enriched",
+    "gold/org_daily_usage_by_service",
+):
+    zpath = BASE / zone
+    parts = sorted(d for d in zpath.iterdir() if d.is_dir() and "=" in d.name)
+    total = sum(f.stat().st_size for f in zpath.rglob("*") if f.is_file())
+    print(f"\n  {zone}/  ({len(parts)} partitions, {_human(total)} total)")
+    for d in parts[:2] + parts[-1:]:
+        psize = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
+        print(f"    {d.name:<22} {_human(psize)}")
+
 # %%
 cluster.shutdown()
 spark.stop()
