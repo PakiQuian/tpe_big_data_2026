@@ -67,13 +67,22 @@ if IN_COLAB:
     os.environ["SERVING_TARGET"] = "astra"
 
     try:
-        os.environ["ASTRA_TOKEN"] = userdata.get("ASTRA_TOKEN")
+        token = userdata.get("ASTRA_TOKEN").strip()
     except Exception as e:
         raise RuntimeError(
             "Falta el secret ASTRA_TOKEN. Agregalo en el panel 🔑 de Colab "
             "(nombre exacto: ASTRA_TOKEN, valor AstraCS:...) y habilitá su acceso "
             "para este notebook."
         ) from e
+    if not token.startswith("AstraCS:"):
+        raise RuntimeError(
+            "El ASTRA_TOKEN no parece un Application Token válido (debe empezar con "
+            "'AstraCS:'). Generá uno en AstraDB → Settings → Tokens con un rol que "
+            "pueda escribir (p. ej. Database Administrator) y pegá el valor COMPLETO "
+            f"en el secret. Recibido: prefijo={token[:8]!r}, largo={len(token)}."
+        )
+    os.environ["ASTRA_TOKEN"] = token
+    print(f"ASTRA_TOKEN OK (prefijo={token[:8]!r}, largo={len(token)})")
 
     # Subir el secure-connect-bundle una sola vez (queda en el cwd = segundo-parcial/).
     bundle = next(
