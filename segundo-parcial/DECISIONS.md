@@ -1,91 +1,99 @@
-# Decision log — Cloud Provider Analytics MVP
+# Log de decisiones — Cloud Provider Analytics MVP
 
-Short rationale for the design choices in this pipeline. Builds on the
-preliminary design in `../primer-parcial/primer-parcial.md`.
+Rationale breve de las decisiones de diseño de este pipeline. Construye sobre el
+diseño preliminar en `../primer-parcial/primer-parcial.md`.
 
-## Architecture pattern: Lambda, scoped for the MVP
+## Patrón de arquitectura: Lambda, acotado para el MVP
 
-We keep the **Lambda** pattern from parcial 1 (batch layer for masters, speed
-layer for usage events), but **scope the speed layer to landing → Bronze only**.
-Silver, Gold and the Cassandra load run as **batch** over the Bronze Parquet.
+Mantenemos el patrón **Lambda** del parcial 1 (capa batch para los maestros, capa
+de velocidad para los usage events), pero **acotamos la capa de velocidad a
+landing → Bronze solamente**. Silver, Gold y la carga a Cassandra corren como
+**batch** sobre el Parquet de Bronze.
 
-- Why: the rubric only requires Structured Streaming for the landing→Bronze hop.
-  Running the rest as batch makes idempotency trivial to demonstrate (overwrite /
-  upsert) and avoids streaming-state and stream-static-join pitfalls.
-- The masters batch job runs **before** the event stream so the Silver
-  enrichment join always has its dimension data.
-- A full-streaming Silver→Gold→serving path remains the production target; this
-  is a deliberate MVP narrowing, not an architecture reversal.
+- Por qué: la consigna solo exige Structured Streaming para el salto
+  landing→Bronze. Correr el resto como batch hace la idempotencia trivial de
+  demostrar (overwrite / upsert) y evita los problemas de estado de streaming y de
+  los stream-static joins.
+- El job batch de maestros corre **antes** del stream de eventos, así el join de
+  enriquecimiento de Silver siempre tiene sus datos dimensionales.
+- Un camino full-streaming Silver→Gold→serving sigue siendo el objetivo de
+  producción; este es un angostamiento deliberado del MVP, no una reversión de
+  arquitectura.
 
-## Partitioning
+## Particionado
 
-- **Usage events** (Bronze/Silver/Gold): partitioned by `date=` (event date).
-  Every business query and the mart are daily-grained, so date partitions prune
-  well.
-- **Masters** (Bronze): partitioned by `ingest_date=` (audit history — one
-  snapshot per ingest). Consumers read the **latest** snapshot (see Idempotency).
-- **No `service=` sub-partition.** With only 43,200 events, adding a 6-way
-  service split would create many tiny files for no query benefit; `service`
-  stays a regular column and Gold re-aggregates by it.
+- **Usage events** (Bronze/Silver/Gold): particionados por `date=` (fecha del
+  evento). Toda consulta de negocio y el mart tienen grano diario, así que las
+  particiones por fecha podan bien.
+- **Maestros** (Bronze): particionados por `ingest_date=` (historia de auditoría —
+  un snapshot por ingesta). Los consumidores leen el snapshot **más reciente** (ver
+  Idempotencia).
+- **Sin sub-partición `service=`.** Con solo 43.200 eventos, agregar un split por
+  servicio de 6 vías crearía muchos archivos diminutos sin beneficio de consulta;
+  `service` queda como columna normal y Gold re-agrega por ella.
 
-## Streaming watermark: 60 days
+## Watermark de streaming: 60 días
 
-`withWatermark("timestamp", "60 days")` on the event stream.
+`withWatermark("timestamp", "60 days")` sobre el stream de eventos.
 
-- The 120 JSONL files arrive in **arbitrary timestamp order**. A watermark
-  advances to `max(event_time) − threshold`; once one micro-batch contains a
-  late-August event, a *tight* watermark would mark every later July file as
-  "late" and silently drop it (including via `dropDuplicatesWithinWatermark`).
-- The data spans ~59 days (2025-07-03 … 2025-08-31), so a 60-day watermark keeps
-  every event while still bounding dedup state (43k event_ids is trivial).
-- In production with real-time arrival this would be minutes; 60 days is correct
-  **for historical replay**.
+- Los 120 archivos JSONL llegan en **orden de timestamp arbitrario**. Un watermark
+  avanza a `max(event_time) − umbral`; una vez que un micro-batch contiene un
+  evento de fines de agosto, un watermark *ajustado* marcaría todo archivo de julio
+  posterior como "tardío" y lo descartaría en silencio (incluso vía
+  `dropDuplicatesWithinWatermark`).
+- Los datos abarcan ~59 días (2025-07-03 … 2025-08-31), así que un watermark de 60
+  días conserva todos los eventos a la vez que acota el estado de dedup (43k
+  event_ids es trivial).
+- En producción con arribo en tiempo real esto serían minutos; 60 días es lo
+  correcto **para el replay histórico**.
 
-## Data-quality rules and thresholds
+## Reglas de calidad de datos y umbrales
 
-Three active rules on the Bronze→Silver transition:
+Tres reglas activas en la transición Bronze→Silver:
 
-- **R1** `event_id IS NULL` → **quarantine** (structurally broken). Active but 0
-  hits in this dataset (no null event_ids) — wired and unit-tested regardless.
-- **R2** `cost_usd_increment < -0.01` → **kept + `cost_anomaly_flag`** (a
-  business anomaly, not corruption). 226 negative-cost events in the data.
-- **R3** `value IS NOT NULL AND unit IS NULL` → **quarantine** (unit-inconsistent).
-  1,978 rows quarantined, all tagged `dq_rule = unit_missing_with_value`.
+- **R1** `event_id IS NULL` → **quarantine** (estructuralmente roto). Activa pero 0
+  hits en este dataset (no hay event_ids nulos) — cableada y testeada igual.
+- **R2** `cost_usd_increment < -0.01` → **se conserva + `cost_anomaly_flag`** (una
+  anomalía de negocio, no corrupción). 226 eventos con costo negativo en los datos.
+- **R3** `value IS NOT NULL AND unit IS NULL` → **quarantine** (unit inconsistente).
+  1.978 filas en quarantine, todas etiquetadas `dq_rule = unit_missing_with_value`.
 
-**Statistical anomaly**: `cost_usd` outside per-service **p01/p99** percentiles is
-also flagged. Combined with R2, 624 of 41,222 Silver rows carry
-`cost_anomaly_flag`. Threshold `-0.01` (not `0`) tolerates floating-point noise.
+**Anomalía estadística**: `cost_usd` fuera de los percentiles **p01/p99** por
+servicio también se marca. Combinada con R2, 624 de 41.222 filas Silver llevan
+`cost_anomaly_flag`. Umbral `-0.01` (no `0`) tolera el ruido de punto flotante.
 
-## Cassandra (AstraDB) — query-first keys
+## Cassandra (AstraDB) — claves query-first
 
-Two tables, one per mandatory query:
+Dos tablas, una por consulta obligatoria:
 
 - **`org_daily_usage_by_service`** — `PRIMARY KEY ((org_id), event_date, service)`.
-  Serves query #1 (`WHERE org_id=? AND event_date>=? AND event_date<=?`): partition
-  by org, range-slice on the `event_date` clustering column.
+  Sirve la consulta #1 (`WHERE org_id=? AND event_date>=? AND event_date<=?`):
+  partición por org, range-slice sobre la columna de clustering `event_date`.
 - **`org_service_cost_14d`** — `PRIMARY KEY ((org_id), total_cost_usd, service)
-  WITH CLUSTERING ORDER BY (total_cost_usd DESC)`. Serves query #2 (top-N services
-  by 14-day cost): `WHERE org_id=? LIMIT n` returns the top-N directly, no
-  client-side sort.
+  WITH CLUSTERING ORDER BY (total_cost_usd DESC)`. Sirve la consulta #2 (top-N
+  servicios por costo a 14 días): `WHERE org_id=? LIMIT n` devuelve el top-N
+  directo, sin sort del lado del cliente.
 
-Load via the Python `cassandra-driver` (not the Spark connector, whose Spark 4.0
-/ Scala 2.13 support lags). Develop against Docker Cassandra; final evidence
-captured against AstraDB via the `SERVING_TARGET` switch.
+Carga vía el `cassandra-driver` de Python (no el conector de Spark, cuyo soporte
+para Spark 4.0 / Scala 2.13 va atrasado). Desarrollo contra Cassandra en Docker;
+evidencia final capturada contra AstraDB vía el switch `SERVING_TARGET`.
 
-## Idempotency
+## Idempotencia
 
-- **Bronze events**: streaming checkpoint — re-running resumes from committed
-  offsets, so no event is reprocessed.
-- **Masters / Silver / Gold**: `mode("overwrite")`.
-- **Cassandra daily table**: upsert by primary key (overwrites in place).
-- **Cassandra 14d table**: its primary key includes `total_cost_usd`, so a
-  changed value on re-run would insert a *new* row and orphan the old one. It is
-  a full snapshot, so we **truncate-then-load** to stay idempotent.
+- **Eventos Bronze**: checkpoint de streaming — re-ejecutar reanuda desde los
+  offsets confirmados, así ningún evento se reprocesa.
+- **Maestros / Silver / Gold**: `mode("overwrite")`.
+- **Tabla daily de Cassandra**: upsert por primary key (sobrescribe in place).
+- **Tabla 14d de Cassandra**: su primary key incluye `total_cost_usd`, así que un
+  valor cambiado en una re-ejecución insertaría una fila *nueva* y dejaría
+  huérfana la vieja. Como es un snapshot completo, hacemos **truncate-y-recarga**
+  para mantenerla idempotente.
 
-**Lesson learned (bug fixed):** masters are written with `ingest_date=current_date()`
-under `partitionOverwriteMode=dynamic`. Running on two different calendar days
-left **two** `ingest_date` partitions, so reading the whole master directory
-duplicated every dimension row and **doubled** the Silver enrichment join (e.g.
-one org/day/service cost read `17.75` instead of `8.87`). Fix: `read_latest_master`
-reads only the newest `ingest_date` snapshot. Same-day re-runs were always
-idempotent; this made cross-day runs correct too.
+**Lección aprendida (bug corregido):** los maestros se escriben con
+`ingest_date=current_date()` bajo `partitionOverwriteMode=dynamic`. Correr en dos
+días calendario distintos dejó **dos** particiones `ingest_date`, así que leer todo
+el directorio del maestro duplicaba cada fila dimensional y **duplicaba** el join
+de enriquecimiento de Silver (p. ej. un costo por org/día/servicio leía `17.75` en
+vez de `8.87`). Fix: `read_latest_master` lee solo el snapshot `ingest_date` más
+nuevo. Las re-ejecuciones del mismo día siempre fueron idempotentes; esto hizo
+correctas también las corridas cruzando días.

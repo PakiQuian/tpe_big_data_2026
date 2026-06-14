@@ -1,31 +1,32 @@
-# Cloud Provider Analytics — End-to-End MVP (Segundo Parcial)
+# Cloud Provider Analytics — MVP End-to-End (Segundo Parcial)
 
-A minimal but complete data pipeline: **landing → Bronze → Silver → Gold →
-Serving (Cassandra)** built with PySpark + Structured Streaming, against the
-provided Cloud Provider Analytics dataset (7 CSV masters + 120 JSONL usage-event
-files, 43,200 events).
+Un pipeline de datos mínimo pero completo: **landing → Bronze → Silver → Gold →
+Serving (Cassandra)** construido con PySpark + Structured Streaming, sobre el
+dataset provisto Cloud Provider Analytics (7 maestros CSV + 120 archivos JSONL de
+usage events, 43.200 eventos).
 
-The whole pipeline is one script, `pipeline.py` (jupytext "percent" format), with
-pure transforms factored into `cpa.py` and the Cassandra serving layer in
-`serving.py`. `pipeline.ipynb` is the generated Colab notebook.
+Todo el pipeline es un único script, `pipeline.py` (formato jupytext "percent"),
+con las transformaciones puras factorizadas en `cpa.py` y la capa de serving de
+Cassandra en `serving.py`. `pipeline.ipynb` es el notebook generado para Colab.
 
-## Architecture (MVP scope)
+## Arquitectura (alcance del MVP)
 
-Lambda pattern; for the MVP the **streaming** path covers only landing→Bronze of
-usage events, and everything after runs as **batch** over the Bronze Parquet.
+Patrón Lambda; para el MVP el camino de **streaming** cubre solo landing→Bronze de
+los usage events, y todo lo que sigue corre como **batch** sobre el Parquet de
+Bronze.
 
 ```mermaid
 flowchart LR
     subgraph Landing
-      CSV[7 master CSVs]
+      CSV[7 maestros CSV]
       JSONL[usage_events_stream/*.jsonl]
     end
     subgraph Bronze
-      BM[masters/* parquet<br/>by ingest_date]
-      BE[usage_events parquet<br/>by date]
+      BM[masters/* parquet<br/>por ingest_date]
+      BE[usage_events parquet<br/>por date]
     end
     subgraph Silver
-      SE[usage_events_enriched<br/>+ DQ + anomaly flags]
+      SE[usage_events_enriched<br/>+ DQ + flags de anomalía]
       Q[quarantine/usage_events]
     end
     subgraph Gold
@@ -39,40 +40,41 @@ flowchart LR
 
     CSV -->|batch| BM
     JSONL -->|Structured Streaming<br/>watermark, dedup, checkpoint| BE
-    BM -->|broadcast join latest snapshot| SE
+    BM -->|broadcast join último snapshot| SE
     BE -->|conform + enrich| SE
-    SE -.->|DQ rules R1/R3| Q
-    SE -->|aggregate| GD --> G14
+    SE -.->|reglas DQ R1/R3| Q
+    SE -->|agregación| GD --> G14
     GD -->|upsert| T1
     G14 -->|truncate+load| T2
-    T1 -->|query #1| R1[daily cost+requests<br/>by org+service, date range]
-    T2 -->|query #2| R2[top-N services<br/>by 14d cost]
+    T1 -->|consulta #1| R1[costo+requests diario<br/>por org+servicio, rango de fechas]
+    T2 -->|consulta #2| R2[top-N servicios<br/>por costo a 14 días]
 ```
 
 ## Quickstart (local)
 
-Prereqs: [uv](https://docs.astral.sh/uv/), a JDK 17 or 21 (Spark needs it), and
-Docker (for local Cassandra).
+Requisitos: [uv](https://docs.astral.sh/uv/), un JDK 17 o 21 (Spark lo necesita) y
+Docker (para la Cassandra local).
 
 ```bash
 cd segundo-parcial
 
-# 1. Python env (uv pins Python 3.12 + installs pyspark, cassandra-driver, ...)
+# 1. Entorno Python (uv fija Python 3.12 + instala pyspark, cassandra-driver, ...)
 uv sync
 
-# 2. Local Cassandra
+# 2. Cassandra local
 docker run -d --name cpa-cassandra -p 9042:9042 cassandra:5
-# wait ~40s until ready:
+# esperar ~40s hasta que esté lista:
 until docker exec cpa-cassandra cqlsh -e "describe keyspaces" >/dev/null 2>&1; do sleep 3; done
 
-# 3. Run the pipeline (JAVA_HOME must point at a JDK 17/21)
+# 3. Correr el pipeline (JAVA_HOME debe apuntar a un JDK 17/21)
 JAVA_HOME=/usr/lib/jvm/java-21-temurin-jdk uv run python pipeline.py
 ```
 
-This ingests masters + streams events to Bronze, builds Silver (DQ + quarantine +
-anomaly), Gold (`org_daily_usage_by_service` + `org_service_cost_14d`), loads both
-Cassandra tables, runs business queries #1 and #2, and prints the idempotency /
-partition evidence. **Re-run it and the per-zone counts are identical.**
+Esto ingesta los maestros + streamea los eventos a Bronze, construye Silver (DQ +
+quarantine + anomalía), Gold (`org_daily_usage_by_service` + `org_service_cost_14d`),
+carga ambas tablas de Cassandra, ejecuta las consultas de negocio #1 y #2, e
+imprime la evidencia de idempotencia / particionado. **Volvé a correrlo y los
+conteos por zona son idénticos.**
 
 ### Tests
 
@@ -80,52 +82,59 @@ partition evidence. **Re-run it and the per-zone counts are identical.**
 JAVA_HOME=/usr/lib/jvm/java-21-temurin-jdk uv run pytest -q
 ```
 
-Pure-transform unit tests (schema registry, Silver, Gold) always run; the
-Cassandra serving tests run if a local Cassandra is reachable, else skip.
+Los tests unitarios de transformaciones puras (registro de esquemas, Silver, Gold)
+siempre corren; los tests de serving de Cassandra corren si hay una Cassandra local
+accesible, si no se saltean.
 
 ## Colab
 
-Open `pipeline.ipynb` in Colab and run top-to-bottom. `LOCAL` auto-detects Colab
-and uses `BASE=/content/datalake`; `!pip install pyspark cassandra-driver` and
-clone this repo so `cpa.py` / `serving.py` / the `datalake/landing` data are
-present. Point `SERVING_TARGET` at `astra` (below) since Colab has no local
-Cassandra.
+Abrí `pipeline.ipynb` en Colab y corré de arriba a abajo. La primera celda
+(**Bootstrap de Colab**) se autodetecta en Colab y hace todo el setup: clona este
+repo, instala `pyspark` + `cassandra-driver` + un JDK 17, y se posiciona en
+`segundo-parcial/` para que `cpa.py`, `serving.py` y `datalake/landing` queden en
+rutas relativas. No hace falta nada manual. Como Colab no tiene Cassandra local,
+apuntá `SERVING_TARGET=astra` (ver abajo) — por ejemplo, definiendo las variables
+de entorno en una celda antes de ejecutar el resto.
 
-## AstraDB (final serving evidence)
+## AstraDB (evidencia final de serving)
 
-The rubric asks for the two queries run against **AstraDB**. The code is
-identical — only the connection switches.
+La consigna pide las dos consultas corridas contra **AstraDB**. El código es
+idéntico — solo cambia la conexión.
 
-1. Create a free Serverless database at [astra.datastax.com], keyspace
+1. Creá una base Serverless gratuita en [astra.datastax.com], keyspace
    **`cloud_analytics`**.
-2. Download the **Secure Connect Bundle** (`.zip`) and generate an **Application
-   Token** (`AstraCS:...`).
-3. Load + query against Astra:
+2. Descargá el **Secure Connect Bundle** (`.zip`) y generá un **Application Token**
+   (`AstraCS:...`).
+3. Cargá + consultá contra Astra:
    ```bash
-   ASTRA_BUNDLE=/path/secure-connect-...zip \
+   ASTRA_BUNDLE=/ruta/secure-connect-...zip \
    ASTRA_TOKEN=AstraCS:xxxxx \
    SERVING_TARGET=astra \
    JAVA_HOME=/usr/lib/jvm/java-21-temurin-jdk \
    uv run python pipeline.py
    ```
-4. In the AstraDB **CQL Console**, run the two queries from `cql/queries.cql` and
-   screenshot the results.
+4. En la **CQL Console** de AstraDB, ejecutá las dos consultas de `cql/queries.cql`
+   y sacá captura de los resultados.
 
-## Layout
+Las capturas de las dos consultas corridas contra AstraDB están en
+[`evidence/astra/`](evidence/astra/README.md).
+
+## Estructura
 
 ```
 segundo-parcial/
-  pipeline.py        # driver (jupytext percent) — read top to bottom
-  pipeline.ipynb     # generated notebook for Colab
-  cpa.py             # pure: schema registry + Silver/Gold transforms
-  serving.py         # Cassandra connect / DDL / upsert / queries
+  pipeline.py        # driver (jupytext percent) — leer de arriba a abajo
+  pipeline.ipynb     # notebook generado para Colab
+  cpa.py             # puro: registro de esquemas + transformaciones Silver/Gold
+  serving.py         # Cassandra connect / DDL / upsert / consultas
   cql/               # schema.cql + queries.cql
-  tests/             # pytest (schema, Silver, Gold unit; serving integration)
+  tests/             # pytest (esquema, Silver, Gold unit; serving integración)
   datalake/
-    landing/         # source data (committed)
-    bronze/ silver/ gold/ quarantine/ checkpoints/   # generated (gitignored)
-  DECISIONS.md       # design rationale + thresholds
+    landing/         # datos fuente (versionados)
+    bronze/ silver/ gold/ quarantine/ checkpoints/   # generados (en gitignore)
+  DECISIONS.md       # rationale de diseño + umbrales
 ```
 
-See `DECISIONS.md` for the Lambda scope, partition/watermark/Cassandra-key
-choices, DQ thresholds, and the idempotency design.
+Ver `DECISIONS.md` para el alcance Lambda, las elecciones de
+partición/watermark/claves-Cassandra, los umbrales de DQ y el diseño de
+idempotencia.

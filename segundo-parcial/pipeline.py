@@ -1,31 +1,61 @@
 # %% [markdown]
-# # Cloud Provider Analytics — End-to-End MVP (Segundo Parcial)
+# # Cloud Provider Analytics — MVP End-to-End (Segundo Parcial)
 #
-# End-to-end pipeline: landing → Bronze → Silver → Gold → Serving (Cassandra).
+# Pipeline end-to-end: landing → Bronze → Silver → Gold → Serving (Cassandra).
 #
-# Built incrementally as vertical slices:
-# - #2 tracer bullet — the full spine, minimal at every layer.
-# - #3 Bronze masters — all 7 CSV masters via the `cpa.MASTERS` registry.
-# - #4 Bronze streaming — usage events via Structured Streaming (watermark,
+# Construido de forma incremental como *slices* verticales:
+# - #2 *tracer bullet* — la espina dorsal completa, mínima en cada capa.
+# - #3 Bronze maestros — los 7 maestros CSV vía el registro `cpa.MASTERS`.
+# - #4 Bronze streaming — usage events vía Structured Streaming (watermark,
 #   dedup, checkpoint).
-# - #5 Silver — conformance, enrichment, 3 DQ rules + quarantine, anomaly flags.
-# - #6 Gold — FinOps mart `org_daily_usage_by_service` + 14-day cost rollup.
-# - #7 Serving — two query-first Cassandra tables, business queries #1 and #2.
-#
-# Remaining: idempotency evidence + artifacts (DECISIONS.md, diagram, README,
-# ipynb) in #8.
+# - #5 Silver — conformance, enriquecimiento, 3 reglas de calidad + quarantine,
+#   flags de anomalía.
+# - #6 Gold — mart FinOps `org_daily_usage_by_service` + rollup de costo a 14 días.
+# - #7 Serving — dos tablas Cassandra *query-first*, consultas de negocio #1 y #2.
+# - #8 — evidencia de idempotencia + artefactos (DECISIONS.md, diagrama, README,
+#   ipynb).
 
 # %% [markdown]
-# ## Configuration
+# ## Bootstrap de Colab
 #
-# A single place that switches local vs Colab and Docker vs AstraDB. The same
-# `pipeline.py` runs in both environments by changing only these values.
+# Solo se ejecuta en Colab: clona el repo, instala las dependencias (incluido un
+# JDK 17 que Spark 4 necesita) y se posiciona en `segundo-parcial/`, de modo que
+# `cpa.py`, `serving.py` y `datalake/landing` queden en rutas relativas —
+# exactamente como en un checkout local. Fuera de Colab no hace nada.
+
+# %%
+try:
+    import google.colab  # noqa: F401
+
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+
+if IN_COLAB:
+    import os
+    import subprocess
+
+    REPO = "https://github.com/PakiQuian/tpe_big_data_2026.git"
+    if not os.path.isdir("tpe_big_data_2026"):
+        subprocess.run(["git", "clone", "--depth", "1", REPO], check=True)
+    os.chdir("tpe_big_data_2026/segundo-parcial")
+
+    subprocess.run(["apt-get", "-qq", "install", "-y", "openjdk-17-jdk-headless"], check=True)
+    os.environ["JAVA_HOME"] = "/usr/lib/jvm/java-17-openjdk-amd64"
+    subprocess.run(["pip", "install", "-q", "pyspark==4.0.*", "cassandra-driver"], check=True)
+    print("Bootstrap de Colab listo; cwd:", os.getcwd())
+
+# %% [markdown]
+# ## Configuración
+#
+# Un único lugar que conmuta local vs Colab y Docker vs AstraDB. El mismo
+# `pipeline.py` corre en ambos entornos cambiando solo estos valores.
 
 # %%
 import os
 from pathlib import Path
 
-# Local vs Colab is auto-detected; override by setting LOCAL manually if needed.
+# Local vs Colab se autodetecta; forzar LOCAL manualmente si hiciera falta.
 try:
     import google.colab  # noqa: F401
 
@@ -36,11 +66,12 @@ except ImportError:
 SERVING_TARGET = os.environ.get("SERVING_TARGET", "docker")  # "docker" | "astra"
 
 if LOCAL:
-    # System Java is 25 (too new for Spark); point at the project's Temurin-21.
+    # El Java del sistema es 25 (demasiado nuevo para Spark); apuntamos al Temurin-21.
     os.environ.setdefault("JAVA_HOME", "/usr/lib/jvm/java-21-temurin-jdk")
-    BASE = Path("datalake")
-else:
-    BASE = Path("/content/datalake")
+
+# En Colab el bootstrap ya hizo chdir a segundo-parcial/, así que la ruta relativa
+# `datalake` sirve igual que en local.
+BASE = Path("datalake")
 
 LANDING = BASE / "landing"
 BRONZE = BASE / "bronze"
@@ -80,13 +111,13 @@ import cpa
 from pyspark.sql import functions as F
 
 # %% [markdown]
-# ## Bronze — ingest all 7 masters (parameterized loop)
+# ## Bronze — ingesta de los 7 maestros (loop parametrizado)
 #
-# Each master is read with an explicit schema from the `cpa.MASTERS` registry (no
-# inference), deduped on its natural key, stamped with technical columns
-# (`ingest_ts`, `source_file`), and written partitioned by `ingest_date` with
-# overwrite so a same-day re-run is idempotent. `escape='"'` handles the embedded
-# JSON in `resources.tags_json`.
+# Cada maestro se lee con un esquema explícito del registro `cpa.MASTERS` (sin
+# inferencia), se deduplica por su clave natural, se sella con columnas técnicas
+# (`ingest_ts`, `source_file`) y se escribe particionado por `ingest_date` con
+# overwrite, de modo que una re-ejecución el mismo día es idempotente. `escape='"'`
+# maneja el JSON embebido en `resources.tags_json`.
 
 
 # %%
@@ -115,25 +146,27 @@ for name, spec in cpa.MASTERS.items():
     print(f"bronze master {name:<18} rows: {n}")
 
 # %% [markdown]
-# ## Bronze — usage events via Structured Streaming
+# ## Bronze — usage events vía Structured Streaming
 #
-# Reads `usage_events_stream/*.jsonl` as a stream with the explicit superset
-# schema (`cpa.EVENTS_SCHEMA`, v1 ∪ v2). Key behaviors:
+# Lee `usage_events_stream/*.jsonl` como stream con el esquema superset explícito
+# (`cpa.EVENTS_SCHEMA`, v1 ∪ v2). Comportamientos clave:
 #
-# - **Watermark = 60 days** on event time. The files arrive in arbitrary
-#   timestamp order, so a tight watermark would mark whole out-of-order files as
-#   "late" and silently drop them. Sizing it to the historical replay span keeps
-#   every event while still bounding dedup state. (Production with real-time
-#   arrival would use minutes — see DECISIONS.md.)
-# - **Dedup by `event_id`** via `dropDuplicatesWithinWatermark`, defending
-#   against re-delivery / reprocessing.
-# - **`maxFilesPerTrigger=4` + `availableNow` trigger**: chunks the 120 files
-#   into many micro-batches and then stops on its own, so the notebook runs
-#   top-to-bottom and terminates.
-# - **Checkpointing**: offsets + dedup state under `checkpoints/`. Re-running
-#   resumes from committed offsets (no reprocessing) — the idempotency story.
+# - **Watermark = 60 días** sobre el tiempo de evento. Los archivos llegan en
+#   orden de timestamp arbitrario, así que un watermark ajustado marcaría archivos
+#   enteros fuera de orden como "tardíos" y los descartaría en silencio.
+#   Dimensionarlo al span del replay histórico conserva todos los eventos a la vez
+#   que acota el estado de dedup. (En producción con arribo en tiempo real serían
+#   minutos — ver DECISIONS.md.)
+# - **Dedup por `event_id`** vía `dropDuplicatesWithinWatermark`, defendiendo
+#   contra re-entrega / reprocesamiento.
+# - **`maxFilesPerTrigger=4` + trigger `availableNow`**: parte los 120 archivos en
+#   muchos micro-batches y luego se detiene solo, de modo que el notebook corre de
+#   arriba a abajo y termina.
+# - **Checkpointing**: offsets + estado de dedup bajo `checkpoints/`. Re-ejecutar
+#   reanuda desde los offsets confirmados (sin reprocesar) — la base de la
+#   idempotencia.
 #
-# Bronze stays permissive; data-quality rules + quarantine live in Silver (#5).
+# Bronze se mantiene permisivo; las reglas de calidad + quarantine viven en Silver (#5).
 
 # %%
 events_stream = (
@@ -160,17 +193,19 @@ bronze_events_count = spark.read.parquet(str(BRONZE / "usage_events")).count()
 print("bronze events rows:", bronze_events_count)
 
 # %% [markdown]
-# ## Silver — conformance, enrichment, data quality, anomaly flags
+# ## Silver — conformance, enriquecimiento, calidad de datos, flags de anomalía
 #
-# Pure transforms from `cpa`:
-# 1. `conform_and_enrich` — v1/v2 conformance, features, broadcast LEFT join to
-#    the org master.
-# 2. `apply_dq_rules` — split clean vs quarantine (R1 event_id null, R3 value
-#    without unit); negative cost (R2) is kept and flagged, not quarantined.
-# 3. `flag_cost_anomalies` — `cost_anomaly_flag` from negative cost OR per-service
-#    p01/p99 outliers.
+# Transformaciones puras de `cpa`:
+# 1. `conform_and_enrich` — conformance v1/v2, features, broadcast LEFT join al
+#    maestro de organizaciones.
+# 2. `apply_dq_rules` — separa limpios vs quarantine (R1 event_id nulo, R3 value
+#    sin unit); el costo negativo (R2) se conserva y se marca, no se pone en
+#    quarantine.
+# 3. `flag_cost_anomalies` — `cost_anomaly_flag` por costo negativo O outliers
+#    p01/p99 por servicio.
 #
-# Quarantined rows (with a `dq_rule` reason) go to a separate zone for samples.
+# Las filas en quarantine (con un motivo `dq_rule`) van a una zona separada como
+# muestras.
 
 
 # %%
@@ -220,12 +255,13 @@ if quarantine_count:
 print("cost anomaly flagged rows:", anomaly_count)
 
 # %% [markdown]
-# ## Gold — FinOps mart + 14-day cost rollup
+# ## Gold — mart FinOps + rollup de costo a 14 días
 #
-# `build_gold_daily` → `org_daily_usage_by_service` (grain org × service × day,
-# all measures + `has_anomaly`). `build_cost_14d` → `org_service_cost_14d`, the
-# trailing-14-day per-org/service cost rollup that powers the top-N serving query
-# (#7). The window ends at the latest event date in the mart.
+# `build_gold_daily` → `org_daily_usage_by_service` (grano org × servicio × día,
+# todas las medidas + `has_anomaly`). `build_cost_14d` → `org_service_cost_14d`, el
+# rollup de costo por org/servicio de los últimos 14 días que alimenta la consulta
+# de serving top-N (#7). La ventana termina en la fecha de evento más reciente del
+# mart.
 
 # %%
 silver_g = spark.read.parquet(str(SILVER / "usage_events_enriched"))
@@ -249,13 +285,13 @@ print(
 )
 
 # %% [markdown]
-# ## Serving — Cassandra (Docker for dev, AstraDB for final evidence)
+# ## Serving — Cassandra (Docker para dev, AstraDB para evidencia final)
 #
-# `serving.connect` is the single abstraction that `SERVING_TARGET` switches
-# (Docker contact points vs AstraDB secure-connect bundle). Two query-first
-# tables are loaded with prepared-statement upserts (idempotent by primary key):
-# - `org_daily_usage_by_service` — serves query #1 (date-range slice).
-# - `org_service_cost_14d` — serves query #2 (top-N via clustering DESC + LIMIT).
+# `serving.connect` es la única abstracción que `SERVING_TARGET` conmuta (contact
+# points de Docker vs secure-connect bundle de AstraDB). Dos tablas query-first se
+# cargan con upserts vía prepared statements (idempotentes por primary key):
+# - `org_daily_usage_by_service` — sirve la consulta #1 (slice por rango de fechas).
+# - `org_service_cost_14d` — sirve la consulta #2 (top-N vía clustering DESC + LIMIT).
 
 # %%
 import serving
@@ -275,7 +311,7 @@ n_14d = serving.upsert_cost_14d(session, cost_14d.collect())
 print("cassandra rows upserted:", n_daily, "daily,", n_14d, "rollup")
 
 # %% [markdown]
-# ## Business query #1 — daily cost + requests by org + service over a date range
+# ## Consulta de negocio #1 — costo diario + requests por org + servicio en un rango de fechas
 
 # %%
 import datetime
@@ -292,7 +328,7 @@ for row in q1_rows[:10]:
     )
 
 # %% [markdown]
-# ## Business query #2 — top-N services by 14-day accumulated cost for an org
+# ## Consulta de negocio #2 — top-N servicios por costo acumulado a 14 días para una org
 
 # %%
 top_n = serving.query_top_services_14d(session, sample_org, 5)
@@ -301,14 +337,14 @@ for row in top_n:
     print(f"  {row.service:<12} total_cost_usd={row.total_cost_usd:.2f}")
 
 # %% [markdown]
-# ## Idempotency & partition evidence
+# ## Evidencia de idempotencia y particionado
 #
-# Re-running the whole pipeline yields identical row counts in every zone: Bronze
-# events resume from the streaming checkpoint (no reprocessing), masters / Silver
-# / Gold use overwrite, and Cassandra writes are upserts (the 14d table
-# truncates-then-reloads). Run this notebook twice and compare the table below —
-# the counts do not change. The partition listing evidences "particionado
-# sensato" with real paths and sizes.
+# Re-ejecutar todo el pipeline produce conteos de filas idénticos en cada zona: los
+# eventos Bronze reanudan desde el checkpoint de streaming (sin reprocesar),
+# maestros / Silver / Gold usan overwrite, y las escrituras a Cassandra son upserts
+# (la tabla de 14 días hace truncate-y-recarga). Corré este notebook dos veces y
+# compará la tabla de abajo — los conteos no cambian. El listado de particiones
+# evidencia el "particionado sensato" con rutas y tamaños reales.
 
 
 # %%
