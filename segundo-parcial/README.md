@@ -92,9 +92,18 @@ Abrí `pipeline.ipynb` en Colab y corré de arriba a abajo. La primera celda
 (**Bootstrap de Colab**) se autodetecta en Colab y hace todo el setup: clona este
 repo, instala `pyspark` + `cassandra-driver` + un JDK 17, y se posiciona en
 `segundo-parcial/` para que `cpa.py`, `serving.py` y `datalake/landing` queden en
-rutas relativas. No hace falta nada manual. Como Colab no tiene Cassandra local,
-apuntá `SERVING_TARGET=astra` (ver abajo) — por ejemplo, definiendo las variables
-de entorno en una celda antes de ejecutar el resto.
+rutas relativas. No hace falta nada manual.
+
+Como Colab no tiene Cassandra local, el serving va contra **AstraDB**. La celda
+**AstraDB en Colab** (justo después del bootstrap) lo configura sola; solo tenés
+que, una vez, antes de correr:
+
+1. En la base de AstraDB, crear el keyspace **`cloud_analytics`**.
+2. En Colab, panel **🔑 (Secrets)** → agregar un secret llamado **`ASTRA_TOKEN`**
+   con valor `AstraCS:...` y habilitar "Notebook access". Así el token no queda
+   escrito en el `.ipynb`.
+3. Al correr la celda, subir el **secure-connect-bundle** (`.zip`) en el file
+   picker (queda cacheado; en re-runs no lo vuelve a pedir).
 
 ## AstraDB (evidencia final de serving)
 

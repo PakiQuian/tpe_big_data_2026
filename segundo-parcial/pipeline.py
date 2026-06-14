@@ -46,6 +46,47 @@ if IN_COLAB:
     print("Bootstrap de Colab listo; cwd:", os.getcwd())
 
 # %% [markdown]
+# ## AstraDB en Colab
+#
+# Colab no tiene Cassandra local, así que el serving va contra **AstraDB**. Esta
+# celda (solo en Colab) configura la conexión ANTES de la celda de Configuración:
+#
+# - El **Application Token** se toma de los **Secrets** de Colab (panel 🔑 a la
+#   izquierda): creá un secret llamado `ASTRA_TOKEN` con valor `AstraCS:...` y
+#   habilitá su acceso para este notebook. Así el token no queda escrito en el
+#   `.ipynb`.
+# - El **secure-connect-bundle** (`.zip`) se sube una vez con el file picker (queda
+#   en el cwd; si ya está, no lo vuelve a pedir).
+#
+# Requiere que el keyspace `cloud_analytics` ya exista en la base de AstraDB.
+
+# %%
+if IN_COLAB:
+    from google.colab import files, userdata
+
+    os.environ["SERVING_TARGET"] = "astra"
+
+    try:
+        os.environ["ASTRA_TOKEN"] = userdata.get("ASTRA_TOKEN")
+    except Exception as e:
+        raise RuntimeError(
+            "Falta el secret ASTRA_TOKEN. Agregalo en el panel 🔑 de Colab "
+            "(nombre exacto: ASTRA_TOKEN, valor AstraCS:...) y habilitá su acceso "
+            "para este notebook."
+        ) from e
+
+    # Subir el secure-connect-bundle una sola vez (queda en el cwd = segundo-parcial/).
+    bundle = next(
+        (f for f in os.listdir(".") if f.startswith("secure-connect") and f.endswith(".zip")),
+        None,
+    )
+    if bundle is None:
+        print("Subí tu secure-connect-...zip de AstraDB:")
+        bundle = next(iter(files.upload()))
+    os.environ["ASTRA_BUNDLE"] = os.path.abspath(bundle)
+    print("AstraDB configurado; bundle:", os.environ["ASTRA_BUNDLE"])
+
+# %% [markdown]
 # ## Configuración
 #
 # Un único lugar que conmuta local vs Colab y Docker vs AstraDB. El mismo
