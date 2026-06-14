@@ -8,10 +8,12 @@
 # - #3 Bronze masters — all 7 CSV masters via the `cpa.MASTERS` registry.
 # - #4 Bronze streaming — usage events via Structured Streaming (watermark,
 #   dedup, checkpoint).
+# - #5 Silver — conformance, enrichment, 3 DQ rules + quarantine, anomaly flags.
+# - #6 Gold — FinOps mart `org_daily_usage_by_service` + 14-day cost rollup.
+# - #7 Serving — two query-first Cassandra tables, business queries #1 and #2.
 #
-# Still minimal downstream (single-measure Gold; one Cassandra table; query #1).
-# Full Silver (#5), full Gold + 14d rollup (#6), the 2nd serving table + query #2
-# (#7), and evidence/artifacts (#8) come next.
+# Remaining: idempotency evidence + artifacts (DECISIONS.md, diagram, README,
+# ipynb) in #8.
 
 # %% [markdown]
 # ## Configuration
@@ -170,9 +172,22 @@ print("bronze events rows:", bronze_events_count)
 #
 # Quarantined rows (with a `dq_rule` reason) go to a separate zone for samples.
 
+
 # %%
+def read_latest_master(name: str):
+    """Read only the most recent `ingest_date` snapshot of a master.
+
+    Masters keep one snapshot per ingest_date in Bronze (audit history). A
+    consumer must read the latest snapshot only — reading all partitions would
+    duplicate every dimension row and double the enrichment join.
+    """
+    df = spark.read.parquet(str(BRONZE / "masters" / name))
+    latest = df.agg(F.max("ingest_date")).first()[0]
+    return df.filter(F.col("ingest_date") == F.lit(latest))
+
+
 events_b = spark.read.parquet(str(BRONZE / "usage_events"))
-orgs_b = spark.read.parquet(str(BRONZE / "masters" / "customers_orgs"))
+orgs_b = read_latest_master("customers_orgs")
 
 enriched = cpa.conform_and_enrich(events_b, orgs_b)
 clean, quarantine = cpa.apply_dq_rules(enriched)
@@ -236,98 +251,58 @@ print(
 # %% [markdown]
 # ## Serving — Cassandra (Docker for dev, AstraDB for final evidence)
 #
-# `get_session` is the single abstraction that `SERVING_TARGET` switches. Writes
-# are upserts by primary key, so re-loading is idempotent. Query-first table #2
-# and business query #2 arrive in issue #7.
+# `serving.connect` is the single abstraction that `SERVING_TARGET` switches
+# (Docker contact points vs AstraDB secure-connect bundle). Two query-first
+# tables are loaded with prepared-statement upserts (idempotent by primary key):
+# - `org_daily_usage_by_service` — serves query #1 (date-range slice).
+# - `org_service_cost_14d` — serves query #2 (top-N via clustering DESC + LIMIT).
 
 # %%
-from cassandra.auth import PlainTextAuthProvider
-from cassandra.cluster import Cluster
-from cassandra.concurrent import execute_concurrent_with_args
+import serving
 
-
-def get_session(target):
-    if target == "docker":
-        cluster = Cluster(DOCKER_CONTACT_POINTS, port=DOCKER_PORT)
-        session = cluster.connect()
-        session.execute(
-            f"CREATE KEYSPACE IF NOT EXISTS {CASSANDRA_KEYSPACE} "
-            "WITH replication = {'class':'SimpleStrategy','replication_factor':1}"
-        )
-    elif target == "astra":
-        cloud = {"secure_connect_bundle": ASTRA_BUNDLE}
-        auth = PlainTextAuthProvider("token", ASTRA_TOKEN)
-        cluster = Cluster(cloud=cloud, auth_provider=auth)
-        session = cluster.connect()
-    else:
-        raise ValueError(f"unknown SERVING_TARGET: {target}")
-    session.set_keyspace(CASSANDRA_KEYSPACE)
-    return session, cluster
-
-
-session, cluster = get_session(SERVING_TARGET)
-
-session.execute(
-    """
-    CREATE TABLE IF NOT EXISTS org_daily_usage_by_service (
-        org_id text,
-        event_date date,
-        service text,
-        cost_usd double,
-        org_name text,
-        plan_tier text,
-        PRIMARY KEY ((org_id), event_date, service)
-    )
-    """
+session, cluster = serving.connect(
+    SERVING_TARGET,
+    contact_points=DOCKER_CONTACT_POINTS,
+    port=DOCKER_PORT,
+    keyspace=CASSANDRA_KEYSPACE,
+    astra_bundle=ASTRA_BUNDLE,
+    astra_token=ASTRA_TOKEN,
 )
+serving.create_tables(session)
 
-insert_stmt = session.prepare(
-    """
-    INSERT INTO org_daily_usage_by_service
-        (org_id, event_date, service, cost_usd, org_name, plan_tier)
-    VALUES (?, ?, ?, ?, ?, ?)
-    """
-)
-params = [
-    (
-        r["org_id"],
-        r["event_date"],
-        r["service"],
-        float(r["cost_usd"]) if r["cost_usd"] is not None else 0.0,
-        r["org_name"],
-        r["plan_tier"],
-    )
-    for r in gold_rows
-]
-execute_concurrent_with_args(session, insert_stmt, params, concurrency=32)
-print("cassandra rows upserted:", len(params))
+n_daily = serving.upsert_daily(session, gold_rows)
+n_14d = serving.upsert_cost_14d(session, cost_14d.collect())
+print("cassandra rows upserted:", n_daily, "daily,", n_14d, "rollup")
 
 # %% [markdown]
-# ## Business query #1 — daily cost by org + service over a date range
+# ## Business query #1 — daily cost + requests by org + service over a date range
 
 # %%
 import datetime
 
 sample_org = gold_rows[0]["org_id"]
-q1 = session.prepare(
-    """
-    SELECT org_id, event_date, service, cost_usd
-    FROM org_daily_usage_by_service
-    WHERE org_id = ? AND event_date >= ? AND event_date <= ?
-    """
-)
-q1_rows = list(
-    session.execute(
-        q1, (sample_org, datetime.date(2025, 7, 1), datetime.date(2025, 9, 1))
-    )
+q1_rows = serving.query_daily_by_org(
+    session, sample_org, datetime.date(2025, 7, 1), datetime.date(2025, 9, 1)
 )
 print(f"\nQuery #1 — org={sample_org}, 2025-07-01..2025-09-01  ({len(q1_rows)} rows):")
-for row in q1_rows[:15]:
-    print(f"  {row.event_date}  {row.service:<12} cost_usd={row.cost_usd:.4f}")
+for row in q1_rows[:10]:
+    req = row.requests if row.requests is not None else 0.0
+    print(
+        f"  {row.event_date}  {row.service:<12} cost_usd={row.cost_usd:8.4f}  requests={req:.0f}"
+    )
+
+# %% [markdown]
+# ## Business query #2 — top-N services by 14-day accumulated cost for an org
+
+# %%
+top_n = serving.query_top_services_14d(session, sample_org, 5)
+print(f"\nQuery #2 — top {len(top_n)} services (14d) for org={sample_org}:")
+for row in top_n:
+    print(f"  {row.service:<12} total_cost_usd={row.total_cost_usd:.2f}")
 
 # %%
 cluster.shutdown()
 spark.stop()
 print(
-    "\nPipeline run complete: landing -> Bronze -> Silver -> Gold -> Cassandra -> query #1 OK"
+    "\nPipeline run complete: landing -> Bronze -> Silver -> Gold -> Cassandra -> queries #1/#2 OK"
 )
