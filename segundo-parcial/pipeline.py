@@ -1,19 +1,23 @@
 # %% [markdown]
 # # Cloud Provider Analytics — MVP End-to-End (Segundo Parcial)
 #
-# Pipeline end-to-end: landing → Bronze → Silver → Gold → Serving (Cassandra).
+# Pipeline end-to-end sobre los datos de un proveedor de nube: ingestamos lo crudo
+# de `landing/`, lo estandarizamos y enriquecemos por capas, y publicamos marts de
+# analítica en Cassandra para consumo de BI. El recorrido sigue el modelo de zonas
+# del data lake:
 #
-# Construido de forma incremental como *slices* verticales:
-# - #2 *tracer bullet* — la espina dorsal completa, mínima en cada capa.
-# - #3 Bronze maestros — los 7 maestros CSV vía el registro `cpa.MASTERS`.
-# - #4 Bronze streaming — usage events vía Structured Streaming (watermark,
-#   dedup, checkpoint).
-# - #5 Silver — conformance, enriquecimiento, 3 reglas de calidad + quarantine,
-#   flags de anomalía.
-# - #6 Gold — mart FinOps `org_daily_usage_by_service` + rollup de costo a 14 días.
-# - #7 Serving — dos tablas Cassandra *query-first*, consultas de negocio #1 y #2.
-# - #8 — evidencia de idempotencia + artefactos (DECISIONS.md, diagrama, README,
-#   ipynb).
+# 1. **Bronze** — ingesta cruda y tipada: los 7 maestros (batch) y los usage events
+#    (Structured Streaming), con columnas técnicas de auditoría.
+# 2. **Silver** — conformance v1/v2, enriquecimiento con dimensiones, features de
+#    costo/uso, reglas de calidad con quarantine y flags de anomalía.
+# 3. **Gold** — el mart FinOps `org_daily_usage_by_service` (grano diario por org y
+#    servicio) más un rollup de costo a 14 días.
+# 4. **Serving** — dos tablas Cassandra modeladas *query-first* que responden las
+#    consultas de negocio #1 y #2.
+#
+# El patrón es Lambda acotado al MVP: el streaming cubre landing→Bronze y el resto
+# corre como batch sobre el Parquet de Bronze. El detalle de cada decisión está en
+# `DECISIONS.md`.
 
 # %% [markdown]
 # ## Bootstrap de Colab
@@ -146,7 +150,7 @@ print(f"LOCAL={LOCAL}  SERVING_TARGET={SERVING_TARGET}  BASE={BASE}")
 from pyspark.sql import SparkSession
 
 spark = (
-    SparkSession.builder.appName("cloud-provider-analytics-tracer")
+    SparkSession.builder.appName("cloud-provider-analytics")
     .master("local[*]")
     .config("spark.sql.session.timeZone", "UTC")
     .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
@@ -216,7 +220,7 @@ for name, spec in cpa.MASTERS.items():
 #   reanuda desde los offsets confirmados (sin reprocesar) — la base de la
 #   idempotencia.
 #
-# Bronze se mantiene permisivo; las reglas de calidad + quarantine viven en Silver (#5).
+# Bronze se mantiene permisivo; las reglas de calidad + quarantine viven en Silver.
 
 # %%
 events_stream = (
@@ -310,8 +314,7 @@ print("cost anomaly flagged rows:", anomaly_count)
 # `build_gold_daily` → `org_daily_usage_by_service` (grano org × servicio × día,
 # todas las medidas + `has_anomaly`). `build_cost_14d` → `org_service_cost_14d`, el
 # rollup de costo por org/servicio de los últimos 14 días que alimenta la consulta
-# de serving top-N (#7). La ventana termina en la fecha de evento más reciente del
-# mart.
+# de serving top-N. La ventana termina en la fecha de evento más reciente del mart.
 
 # %%
 silver_g = spark.read.parquet(str(SILVER / "usage_events_enriched"))
@@ -340,7 +343,7 @@ print(
 # `serving.connect` es la única abstracción que `SERVING_TARGET` conmuta (contact
 # points de Docker vs secure-connect bundle de AstraDB). Dos tablas query-first se
 # cargan con upserts vía prepared statements (idempotentes por primary key):
-# - `org_daily_usage_by_service` — sirve la consulta #1 (slice por rango de fechas).
+# - `org_daily_usage_by_service` — sirve la consulta #1 (rango de fechas).
 # - `org_service_cost_14d` — sirve la consulta #2 (top-N vía clustering DESC + LIMIT).
 
 # %%

@@ -1,9 +1,9 @@
 """Cloud Provider Analytics — pure, importable definitions.
 
-This module holds only side-effect-free building blocks (schema registry, dedupe
-specs, and — in later slices — pure DataFrame transforms) so they can be unit
-tested in isolation without running the pipeline. The driver lives in
-``pipeline.py``, which imports from here.
+This module holds only side-effect-free building blocks: the schema registry,
+dedupe specs, and the pure Silver/Gold DataFrame transforms. Keeping them free of
+I/O lets them be unit tested in isolation, without running the pipeline. The
+driver lives in ``pipeline.py``, which imports from here.
 """
 
 from __future__ import annotations
@@ -188,8 +188,8 @@ EVENTS_SCHEMA = StructType(
 
 
 # --------------------------------------------------------------------------- #
-# Silver pure transforms (issue #5) — DataFrame -> DataFrame, no I/O, so they
-# are unit-testable with small in-memory DataFrames.
+# Silver pure transforms — DataFrame -> DataFrame, no I/O, so they are
+# unit-testable with small in-memory DataFrames.
 # --------------------------------------------------------------------------- #
 
 # Org master attributes attached to each event during enrichment.
@@ -261,7 +261,7 @@ def flag_cost_anomalies(
 
 
 # --------------------------------------------------------------------------- #
-# Gold pure transforms (issue #6) — FinOps mart + 14-day rollup.
+# Gold pure transforms — FinOps mart + 14-day rollup.
 # --------------------------------------------------------------------------- #
 
 # Trailing window (days) for the top-N-services-by-cost serving query.

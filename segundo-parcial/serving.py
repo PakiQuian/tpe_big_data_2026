@@ -1,4 +1,4 @@
-"""Cassandra serving layer (issue #7).
+"""Cassandra serving layer.
 
 Connection, DDL, upserts, and the two business queries. This module talks to
 Cassandra (so it is side-effecting), but it is importable and Spark-free so the
