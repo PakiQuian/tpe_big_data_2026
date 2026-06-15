@@ -306,6 +306,10 @@ print("quarantine rows:", quarantine_count)
 if quarantine_count:
     print("  quarantine reasons:")
     q_df.groupBy("dq_rule").count().show(truncate=False)
+    print("  quarantine examples (columnas que gatillaron la regla):")
+    q_df.select(
+        "event_id", "service", "metric", "value", "unit", "dq_rule"
+    ).show(5, truncate=False)
 print("cost anomaly flagged rows:", anomaly_count)
 
 # %% [markdown]
