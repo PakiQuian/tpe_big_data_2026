@@ -1,7 +1,9 @@
 # Big Data TP2 — Cloud Provider Analytics
 
-**Materia:** Big Data — 72.80 (ITBA)
-**Entrega:** Segundo Parcial — MVP técnico — 15/06/2026
+**Materia:** Big Data — 72.80
+
+**Fecha de entrega:** 15/06/2026
+
 **Integrantes:**
 
 - Perez de Gracia, Mateo (63401)
@@ -301,7 +303,7 @@ velocidad a landing → Bronze**. Silver, Gold y la carga a Cassandra corren com
 - El job batch de maestros corre **antes** del stream de eventos, así el join de
   enriquecimiento de Silver siempre tiene sus datos dimensionales.
 - Un camino full-streaming Silver→Gold→serving sigue siendo el objetivo de
-  producción; este es un angostamiento deliberado del MVP, no una reversión de
+  producción. Este es una reducción de scope para el MVP, no una reversión de
   arquitectura.
 
 ### Medallion (Bronze / Silver / Gold)
@@ -350,7 +352,7 @@ Tres reglas activas en la transición Bronze→Silver:
 - **R3** `value IS NOT NULL AND unit IS NULL` → **quarantine** (unit inconsistente).
   1 978 filas en quarantine, todas etiquetadas `dq_rule = unit_missing_with_value`.
 
-**Anomalía estadística**: `cost_usd` fuera de los percentiles **p01/p99** por
+**Anomalía estadística**: `cost_usd` fuera de los percentiles **01/99** por
 servicio también se marca. El percentil por servicio se adapta a la distribución
 de costos de cada tipo de servicio (un evento de `genai` cuesta naturalmente más
 que uno de `networking`), cosa que un umbral fijo no haría. Combinada con R2, 624
