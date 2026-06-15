@@ -17,7 +17,7 @@
 #
 # El patrón es Lambda acotado al MVP: el streaming cubre landing→Bronze y el resto
 # corre como batch sobre el Parquet de Bronze. El detalle de cada decisión está en
-# `DECISIONS.md`.
+# el README (sección "Decisiones técnicas").
 
 # %% [markdown]
 # ## Bootstrap de Colab
@@ -210,7 +210,7 @@ for name, spec in cpa.MASTERS.items():
 #   enteros fuera de orden como "tardíos" y los descartaría en silencio.
 #   Dimensionarlo al span del replay histórico conserva todos los eventos a la vez
 #   que acota el estado de dedup. (En producción con arribo en tiempo real serían
-#   minutos — ver DECISIONS.md.)
+#   minutos — ver el README.)
 # - **Dedup por `event_id`** vía `dropDuplicatesWithinWatermark`, defendiendo
 #   contra re-entrega / reprocesamiento.
 # - **`maxFilesPerTrigger=4` + trigger `availableNow`**: parte los 120 archivos en
