@@ -261,6 +261,16 @@ el pipeline imprime esta tabla al final de cada corrida.
 Conservación: Silver 41 222 + quarantine 1 978 = 43 200 eventos Bronze (no se pierde
 ninguna fila). Reprocesar no duplica — ver [Idempotencia](#idempotencia).
 
+### Quarantine — reglas de calidad efectivas (ejemplos)
+
+Al construir Silver, el pipeline imprime cuántas filas cayeron en quarantine, el
+desglose por motivo (`dq_rule`) y una muestra de filas concretas con las columnas
+que gatillaron la regla (p. ej. `value` presente con `unit` nulo →
+`unit_missing_with_value`). Las filas rechazadas quedan en
+`datalake/quarantine/usage_events`, particionadas por fecha, para inspección.
+
+![Quarantine — conteo, motivos y ejemplos](evidence/quarantine.png)
+
 ### Particionado (una partición por día de evento)
 
 ```
