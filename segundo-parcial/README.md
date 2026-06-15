@@ -61,9 +61,9 @@ flowchart LR
 
     CSV -->|batch| BM
     JSONL -->|Structured Streaming<br/>watermark, dedup, checkpoint| BE
+    BE -.->|reglas DQ R1/R3| Q
+    BE -->|conform + DQ| SE
     BM -->|broadcast join último snapshot| SE
-    BE -->|conform + enrich| SE
-    SE -.->|reglas DQ R1/R3| Q
     SE -->|agregación| GD --> G14
     GD -->|upsert| T1
     G14 -->|truncate+load| T2

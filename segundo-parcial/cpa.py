@@ -199,25 +199,38 @@ ORG_ENRICH_COLS = ["org_name", "plan_tier", "industry", "hq_region"]
 NEG_COST_THRESHOLD = -0.01
 
 
-def conform_and_enrich(events: DataFrame, orgs: DataFrame) -> DataFrame:
-    """Conform v1/v2 events, derive features, and enrich with org attributes.
+def conform(events: DataFrame) -> DataFrame:
+    """Conform v1/v2 events and derive features — no dimensional join.
 
     - ``event_date`` derived from the event timestamp.
     - ``genai_tokens`` coalesced to 0 (null = not reported / non-genai; 0 is the
       additive identity for summing).
     - ``carbon_kg`` kept as-is (null for v1 — not fabricated).
     - Features: ``cost_usd``, ``genai_tokens``, ``carbon_kg``, ``requests``.
-    - Broadcast LEFT join to the org master so events with an unknown ``org_id``
-      survive with null org attributes.
+
+    The data-quality split (:func:`apply_dq_rules`) runs on this conformed output,
+    so quarantined rows are raw Bronze events — not yet enriched.
     """
-    enriched = (
+    return (
         events.withColumn("event_date", F.to_date("timestamp"))
         .withColumn("genai_tokens", F.coalesce(F.col("genai_tokens"), F.lit(0)))
         .withColumn("cost_usd", F.col("cost_usd_increment"))
         .withColumn("requests", F.when(F.col("metric") == "requests", F.col("value")))
     )
+
+
+def enrich(events: DataFrame, orgs: DataFrame) -> DataFrame:
+    """Broadcast LEFT join to the org master.
+
+    LEFT so events with an unknown ``org_id`` survive with null org attributes.
+    """
     orgs_dim = orgs.select("org_id", *ORG_ENRICH_COLS)
-    return enriched.join(F.broadcast(orgs_dim), on="org_id", how="left")
+    return events.join(F.broadcast(orgs_dim), on="org_id", how="left")
+
+
+def conform_and_enrich(events: DataFrame, orgs: DataFrame) -> DataFrame:
+    """Conform v1/v2 events and enrich with org attributes (conform + enrich)."""
+    return enrich(conform(events), orgs)
 
 
 def apply_dq_rules(df: DataFrame) -> tuple[DataFrame, DataFrame]:

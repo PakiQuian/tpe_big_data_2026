@@ -249,17 +249,19 @@ print("bronze events rows:", bronze_events_count)
 # %% [markdown]
 # ## Silver — conformance, enriquecimiento, calidad de datos, flags de anomalía
 #
-# Transformaciones puras de `cpa`:
-# 1. `conform_and_enrich` — conformance v1/v2, features, broadcast LEFT join al
-#    maestro de organizaciones.
+# Transformaciones puras de `cpa`, en este orden:
+# 1. `conform` — conformance v1/v2 + features, sin join dimensional.
 # 2. `apply_dq_rules` — separa limpios vs quarantine (R1 event_id nulo, R3 value
-#    sin unit); el costo negativo (R2) se conserva y se marca, no se pone en
-#    quarantine.
-# 3. `flag_cost_anomalies` — `cost_anomaly_flag` por costo negativo O outliers
+#    sin unit) sobre los eventos crudos conformados; el costo negativo (R2) se
+#    conserva y se marca, no se pone en quarantine.
+# 3. `enrich` — broadcast LEFT join al maestro de organizaciones, solo sobre las
+#    filas limpias.
+# 4. `flag_cost_anomalies` — `cost_anomaly_flag` por costo negativo O outliers
 #    p01/p99 por servicio.
 #
-# Las filas en quarantine (con un motivo `dq_rule`) van a una zona separada como
-# muestras.
+# La compuerta de calidad vive en la transición Bronze→Silver: las filas en
+# quarantine (con un motivo `dq_rule`) son eventos crudos de Bronze y van a una
+# zona separada como muestras.
 
 
 # %%
@@ -278,9 +280,12 @@ def read_latest_master(name: str):
 events_b = spark.read.parquet(str(BRONZE / "usage_events"))
 orgs_b = read_latest_master("customers_orgs")
 
-enriched = cpa.conform_and_enrich(events_b, orgs_b)
-clean, quarantine = cpa.apply_dq_rules(enriched)
-silver = cpa.flag_cost_anomalies(clean)
+# La compuerta de calidad corre sobre los eventos crudos conformados (antes del
+# join): las filas en quarantine son eventos de Bronze, sin enriquecer. Solo las
+# limpias se enriquecen y siguen a Silver.
+conformed = cpa.conform(events_b)
+clean, quarantine = cpa.apply_dq_rules(conformed)
+silver = cpa.flag_cost_anomalies(cpa.enrich(clean, orgs_b))
 
 (
     silver.write.mode("overwrite")
