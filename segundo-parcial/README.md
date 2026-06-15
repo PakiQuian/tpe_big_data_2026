@@ -1,9 +1,19 @@
-# Cloud Provider Analytics — MVP End-to-End (Segundo Parcial)
+# Big Data - Cloud Provider Analytics TP2
+
+**Materia:** Big Data -72.80
+**Fecha de entrega:** 15 de junio 2026
+**Integrantes:**
+
+- Perez de Gracia, Mateo (63401)
+- Quian Blanco, Francisco (63006)
+- Stanfield, Theo (63403)
+
+## Objetivo
 
 Un pipeline de datos mínimo pero completo: **landing → Bronze → Silver → Gold →
 Serving (Cassandra)** construido con PySpark + Structured Streaming, sobre el
 dataset provisto Cloud Provider Analytics (7 maestros CSV + 120 archivos JSONL de
-usage events, 43.200 eventos).
+usage events).
 
 Todo el pipeline es un único script, `pipeline.py` (formato jupytext "percent"),
 con las transformaciones puras factorizadas en `cpa.py` y la capa de serving de
@@ -11,7 +21,7 @@ Cassandra en `serving.py`. `pipeline.ipynb` es el notebook generado para Colab.
 
 ## Arquitectura (alcance del MVP)
 
-Patrón Lambda; para el MVP el camino de **streaming** cubre solo landing→Bronze de
+Patrón Lambda. Para el MVP el camino de **streaming** cubre solo landing→Bronze de
 los usage events, y todo lo que sigue corre como **batch** sobre el Parquet de
 Bronze.
 
@@ -50,31 +60,66 @@ flowchart LR
     T2 -->|consulta #2| R2[top-N servicios<br/>por costo a 14 días]
 ```
 
-## Quickstart (local)
+## Quickstart (AstraDB)
 
-Requisitos: [uv](https://docs.astral.sh/uv/), un JDK 17 o 21 (Spark lo necesita) y
-Docker (para la Cassandra local).
+El serving va contra **AstraDB** (Cassandra serverless gestionada). El mismo
+`pipeline.py` corre igual en tu máquina con `uv` o en Colab; lo único que cambia
+es de dónde toma las credenciales de Astra.
+
+### 1. Conseguir las credenciales de Astra (una sola vez)
+
+1. Creá una base **Serverless** gratuita en [astra.datastax.com](https://astra.datastax.com).
+2. Dentro de la base, creá el keyspace **`cloud_analytics`**.
+3. Descargá el **Secure Connect Bundle** (`secure-connect-...zip`).
+4. Generá un **Application Token** (`AstraCS:...`) con un rol que pueda escribir
+   (p. ej. *Database Administrator*) y copiá el valor **completo**.
+
+### 2a. Correr local con uv
+
+Requisitos: [uv](https://docs.astral.sh/uv/) y un JDK 17 o 21.
 
 ```bash
 cd segundo-parcial
 
-# 1. Entorno Python (uv fija Python 3.12 + instala pyspark, cassandra-driver, ...)
+# Entorno Python (uv fija Python 3.12 + instala pyspark, cassandra-driver, ...)
 uv sync
 
-# 2. Cassandra local
-docker run -d --name cpa-cassandra -p 9042:9042 cassandra:5
-# esperar ~40s hasta que esté lista:
-until docker exec cpa-cassandra cqlsh -e "describe keyspaces" >/dev/null 2>&1; do sleep 3; done
-
-# 3. Correr el pipeline (JAVA_HOME debe apuntar a un JDK 17/21)
-JAVA_HOME=/usr/lib/jvm/java-21-temurin-jdk uv run python pipeline.py
+# Correr el pipeline contra Astra
+ASTRA_BUNDLE=/ruta/secure-connect-...zip \
+ASTRA_TOKEN=AstraCS:xxxxx \
+SERVING_TARGET=astra \
+JAVA_HOME=/usr/lib/jvm/java-21-temurin-jdk \
+uv run python pipeline.py
 ```
 
-Esto ingesta los maestros + streamea los eventos a Bronze, construye Silver (DQ +
-quarantine + anomalía), Gold (`org_daily_usage_by_service` + `org_service_cost_14d`),
-carga ambas tablas de Cassandra, ejecuta las consultas de negocio #1 y #2, e
-imprime la evidencia de idempotencia / particionado. **Volvé a correrlo y los
-conteos por zona son idénticos.**
+### 2b. Correr en Colab
+
+Abrí `pipeline.ipynb` en Colab y corré de arriba a abajo. La primera celda
+(**Bootstrap de Colab**) se autodetecta y hace todo el setup: clona este repo,
+instala `pyspark` + `cassandra-driver` + un JDK 17, y se posiciona en
+`segundo-parcial/` para que `cpa.py`, `serving.py` y `datalake/landing` queden en
+rutas relativas. No hace falta nada manual.
+
+La celda **AstraDB en Colab** (justo después del bootstrap) configura el serving
+sola; antes de correrla, solo necesitás:
+
+1. En Colab, panel **🔑 (Secrets)** → agregar un secret llamado **`ASTRA_TOKEN`**
+   con el valor `AstraCS:...` y habilitar "Notebook access". Así el token no queda
+   escrito en el `.ipynb`.
+2. Al correr la celda, subir el **secure-connect-bundle** (`.zip`) en el file
+   picker (queda cacheado; en re-runs no lo vuelve a pedir).
+
+### Qué hace una corrida
+
+Cualquiera de las dos vías ingesta los maestros + streamea los eventos a Bronze,
+construye Silver (DQ + quarantine + anomalía), Gold (`org_daily_usage_by_service`
++ `org_service_cost_14d`), carga ambas tablas en Astra, ejecuta las consultas de
+negocio #1 y #2, e imprime la evidencia de idempotencia / particionado. **Volvé a
+correrlo y los conteos por zona son idénticos.**
+
+Para sacar las capturas finales, en la **CQL Console** de AstraDB ejecutá las dos
+consultas de `cql/queries.cql`. Las capturas ya tomadas están en
+[`evidence/astra/`](evidence/astra/README.md).
 
 ### Tests
 
@@ -86,47 +131,24 @@ Los tests unitarios de transformaciones puras (registro de esquemas, Silver, Gol
 siempre corren; los tests de serving de Cassandra corren si hay una Cassandra local
 accesible, si no se saltean.
 
-## Colab
+## Alternativa: Cassandra local con Docker
 
-Abrí `pipeline.ipynb` en Colab y corré de arriba a abajo. La primera celda
-(**Bootstrap de Colab**) se autodetecta en Colab y hace todo el setup: clona este
-repo, instala `pyspark` + `cassandra-driver` + un JDK 17, y se posiciona en
-`segundo-parcial/` para que `cpa.py`, `serving.py` y `datalake/landing` queden en
-rutas relativas. No hace falta nada manual.
+Si no podés usar Astra (sin conexión, problemas de credenciales, etc.), el serving
+corre igual contra una Cassandra local en Docker — es el valor por defecto
+(`SERVING_TARGET=docker`). Requiere Docker además de `uv` y el JDK.
 
-Como Colab no tiene Cassandra local, el serving va contra **AstraDB**. La celda
-**AstraDB en Colab** (justo después del bootstrap) lo configura sola; solo tenés
-que, una vez, antes de correr:
+```bash
+cd segundo-parcial
+uv sync
 
-1. En la base de AstraDB, crear el keyspace **`cloud_analytics`**.
-2. En Colab, panel **🔑 (Secrets)** → agregar un secret llamado **`ASTRA_TOKEN`**
-   con valor `AstraCS:...` y habilitar "Notebook access". Así el token no queda
-   escrito en el `.ipynb`.
-3. Al correr la celda, subir el **secure-connect-bundle** (`.zip`) en el file
-   picker (queda cacheado; en re-runs no lo vuelve a pedir).
+# Cassandra local
+docker run -d --name cpa-cassandra -p 9042:9042 cassandra:5
+# esperar ~40s hasta que esté lista:
+until docker exec cpa-cassandra cqlsh -e "describe keyspaces" >/dev/null 2>&1; do sleep 3; done
 
-## AstraDB (evidencia final de serving)
-
-La consigna pide las dos consultas corridas contra **AstraDB**. El código es
-idéntico — solo cambia la conexión.
-
-1. Creá una base Serverless gratuita en [astra.datastax.com], keyspace
-   **`cloud_analytics`**.
-2. Descargá el **Secure Connect Bundle** (`.zip`) y generá un **Application Token**
-   (`AstraCS:...`).
-3. Cargá + consultá contra Astra:
-   ```bash
-   ASTRA_BUNDLE=/ruta/secure-connect-...zip \
-   ASTRA_TOKEN=AstraCS:xxxxx \
-   SERVING_TARGET=astra \
-   JAVA_HOME=/usr/lib/jvm/java-21-temurin-jdk \
-   uv run python pipeline.py
-   ```
-4. En la **CQL Console** de AstraDB, ejecutá las dos consultas de `cql/queries.cql`
-   y sacá captura de los resultados.
-
-Las capturas de las dos consultas corridas contra AstraDB están en
-[`evidence/astra/`](evidence/astra/README.md).
+# Correr el pipeline (SERVING_TARGET=docker es el default)
+JAVA_HOME=/usr/lib/jvm/java-21-temurin-jdk uv run python pipeline.py
+```
 
 ## Estructura
 
