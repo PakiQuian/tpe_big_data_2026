@@ -49,19 +49,16 @@ flowchart LR
       BE[usage_events parquet<br/>por date]
     end
     subgraph Silver
-      SE[usage_events_enriched<br/>+ DQ + flags de anomalía z-score/MAD/p-tiles]
+      SE[usage_events_enriched<br/>+ DQ + flags de anomalía]
       Q[quarantine/usage_events]
     end
-    subgraph Gold[Gold - 6 marts]
+    subgraph Gold
       GD[org_daily_usage_by_service]
       G14[org_service_cost_14d]
-      GT[tickets_by_org_date]
-      GR[revenue_by_org_month]
-      GG[genai_tokens_by_org_date]
-      GA[cost_anomaly_by_org_date]
     end
     subgraph Serving[Cassandra / AstraDB]
-      T[(6 tablas query-first)]
+      T1[(org_daily_usage_by_service)]
+      T2[(org_service_cost_14d)]
     end
 
     CSV -->|batch| BM
@@ -70,17 +67,10 @@ flowchart LR
     BE -->|conform + DQ| SE
     BM -->|broadcast join último snapshot| SE
     SE -->|agregación| GD --> G14
-    SE --> GG
-    SE --> GA
-    BM --> GT
-    BM --> GR
-    GD --> T
-    G14 --> T
-    GT --> T
-    GR --> T
-    GG --> T
-    GA --> T
-    T -->|consultas #1–#5 + anomalías| R[dashboards / BI]
+    GD -->|upsert| T1
+    G14 -->|truncate+load| T2
+    T1 -->|consulta #1| R1[costo+requests diario<br/>por org+servicio, rango de fechas]
+    T2 -->|consulta #2| R2[top-N servicios<br/>por costo a 14 días]
 ```
 
 ---
@@ -94,8 +84,8 @@ segundo-parcial/
   cpa.py             # puro: registro de esquemas + transformaciones Silver/Gold
   serving.py         # Cassandra connect / DDL / upsert / consultas
   cql/
-    schema.cql       # keyspace + 6 tablas query-first
-    queries.cql      # las 5 consultas de negocio + la de anomalías
+    schema.cql       # keyspace + 2 tablas query-first
+    queries.cql      # las 2 consultas de negocio
   tests/             # pytest (esquema, Silver, Gold unit; serving integración)
   datalake/
     landing/         # datos fuente (versionados) — inmutable
@@ -165,10 +155,10 @@ sola; antes de correrla, solo necesitás:
 ### Qué hace una corrida
 
 Cualquiera de las dos vías ingesta los maestros + streamea los eventos a Bronze,
-construye Silver (DQ + quarantine + anomalía multi-método), los **6 marts** de Gold,
-carga las 6 tablas en Astra, ejecuta las **5 consultas de negocio** (#1–#5) más la
-consulta extra de anomalías, e imprime la evidencia de idempotencia / particionado.
-**Volvé a correrlo y los conteos por zona son idénticos** (ver [Evidencias](#evidencias)).
+construye Silver (DQ + quarantine + anomalía), Gold (`org_daily_usage_by_service`
++ `org_service_cost_14d`), carga ambas tablas en Astra, ejecuta las consultas de
+negocio #1 y #2, e imprime la evidencia de idempotencia / particionado. **Volvé a
+correrlo y los conteos por zona son idénticos** (ver [Evidencias](#evidencias)).
 
 ### Tests
 
@@ -203,9 +193,8 @@ JAVA_HOME=/usr/lib/jvm/java-21-temurin-jdk uv run python pipeline.py
 
 ## Consultas de negocio
 
-Las cinco consultas obligatorias más una consulta extra de anomalías. Cada tabla de
-serving modela exactamente la consulta que responde (query-first). El CQL exacto
-está en `cql/queries.cql`.
+Las dos consultas obligatorias. Cada tabla de serving modela exactamente la
+consulta que responde (query-first). El CQL exacto está en `cql/queries.cql`.
 
 ### Consulta #1 — costo + requests diario por org + servicio (rango de fechas)
 
@@ -232,57 +221,6 @@ SELECT org_id, service, total_cost_usd
 Servida por `org_service_cost_14d`, cuyo `CLUSTERING ORDER BY (total_cost_usd DESC)`
 devuelve el top-N directo, sin sort del lado del cliente.
 
-### Consulta #3 — tickets críticos y tasa de SLA breach por día (últimos 30 días)
-
-```cql
-SELECT org_id, event_date, severity, ticket_count, sla_breach_count, sla_breach_rate, avg_csat
-  FROM tickets_by_org_date
- WHERE org_id = 'org_0lvsnujz'
-   AND event_date >= '2025-08-02';
-```
-
-Servida por `tickets_by_org_date`; `CLUSTERING ORDER BY (event_date DESC)` entrega
-los días recientes primero (el cliente puede filtrar por `severity`).
-
-### Consulta #4 — revenue mensual con créditos/impuestos normalizado a USD
-
-```cql
-SELECT org_id, month, revenue_usd, subtotal, credits, taxes, currency
-  FROM revenue_by_org_month
- WHERE org_id = 'org_0lvsnujz';
-```
-
-Servida por `revenue_by_org_month`; `revenue_usd = (subtotal − credits + taxes) ×
-exchange_rate_to_usd` se calcula en Gold, así que la consulta ya lee USD.
-
-### Consulta #5 — tokens GenAI y costo estimado por día
-
-```cql
-SELECT org_id, event_date, total_tokens, cost_usd, event_count
-  FROM genai_tokens_by_org_date
- WHERE org_id = 'org_kdgigatj'
-   AND event_date >= '2025-07-01';
-```
-
-Servida por `genai_tokens_by_org_date` (solo eventos de `service = 'genai'`). Ojo:
-no todos los orgs usan GenAI (la consigna dice "si existen"), así que esta consulta
-apunta a un org con actividad GenAI; `org_0lvsnujz` (usado por las otras consultas)
-no tiene consumo y daría 0 filas.
-
-### Consulta extra — top anomalías de costo (multi-método)
-
-```cql
-SELECT org_id, event_date, service, anomaly_score, methods,
-       score_zscore, score_mad, score_ptiles, score_negative
-  FROM cost_anomaly_by_org_date
- WHERE org_id = 'org_0lvsnujz'
- LIMIT 10;
-```
-
-Servida por `cost_anomaly_by_org_date`; `CLUSTERING ORDER BY (anomaly_score DESC)`
-devuelve las peores anomalías directo. `methods` muestra qué detectores coincidieron
-y cada `score_*` cuán fuerte fue.
-
 ---
 
 ## Evidencias
@@ -306,37 +244,6 @@ El clustering DESC devuelve el top-N directo: `analytics 251.80`, `database 148.
 
 ![Consulta #2 — top servicios 14d](evidence/astra/query2_top_services_14d.png)
 
-**Consulta #3** — tickets críticos y tasa de SLA breach por día (últimos 30 días)
-
-`org_0lvsnujz`; incluye un ticket con `sla_breach_rate = 1` (breach al 100%).
-
-![Consulta #3 — tickets + SLA breach](evidence/astra/query3_tickets_sla.png)
-
-**Consulta #4** — revenue mensual con créditos/impuestos normalizado a USD
-
-`org_0lvsnujz`; muestra la normalización multi-moneda: la fila de agosto/julio en
-`USD` queda casi igual, y la de junio en `ARS` (subtotal 1316) se normaliza a
-`2.42 USD` aplicando el `exchange_rate_to_usd`.
-
-![Consulta #4 — revenue mensual en USD](evidence/astra/query4_revenue_by_month.png)
-
-**Consulta #5** — tokens GenAI y costo estimado por día
-
-`org_kdgigatj` (org con consumo de GenAI). Nótese que los días de julio con
-`total_tokens = 0` son eventos v1 (sin `genai_tokens` en origen → 0) que igual
-tienen costo — el conformado v1/v2 no fabrica tokens.
-
-![Consulta #5 — tokens GenAI (parte 1)](evidence/astra/query5_genai_tokens_1.png)
-![Consulta #5 — tokens GenAI (parte 2)](evidence/astra/query5_genai_tokens_2.png)
-
-**Consulta extra — top anomalías de costo (multi-método)**
-
-`org_0lvsnujz`, peores primero. Se ve el **consenso** y las **colecciones**: el set
-`methods` marca los detectores que coincidieron (`{zscore,mad,ptiles}`) y el map
-`scores` el peso de cada uno; `negative` aparece cuando además hay costo negativo.
-
-![Consulta anomalías — top multi-método](evidence/astra/query_anomalies_top.png)
-
 ### Conteos por capa — idénticos entre re-ejecuciones
 
 Capturado corriendo `pipeline.py` dos veces seguidas (sin limpiar entre corridas);
@@ -350,16 +257,8 @@ el pipeline imprime esta tabla al final de cada corrida.
 | quarantine / usage_events | 1 978 | 1 978 |
 | gold / org_daily_usage_by_service | 11 050 | 11 050 |
 | gold / org_service_cost_14d | 262 | 262 |
-| gold / tickets_by_org_date | 984 | 984 |
-| gold / revenue_by_org_month | 240 | 240 |
-| gold / genai_tokens_by_org_date | 1 131 | 1 131 |
-| gold / cost_anomaly_by_org_date | 598 | 598 |
 | cassandra / org_daily_usage_by_service | 11 050 | 11 050 |
 | cassandra / org_service_cost_14d | 262 | 262 |
-| cassandra / tickets_by_org_date | 984 | 984 |
-| cassandra / revenue_by_org_month | 240 | 240 |
-| cassandra / genai_tokens_by_org_date | 1 131 | 1 131 |
-| cassandra / cost_anomaly_by_org_date | 598 | 598 |
 
 Conservación: Silver 41 222 + quarantine 1 978 = 43 200 eventos Bronze (no se pierde
 ninguna fila). Reprocesar no duplica — ver [Idempotencia](#idempotencia).
@@ -413,7 +312,7 @@ velocidad a landing → Bronze**. Silver, Gold y la carga a Cassandra corren com
 |---|---|
 | Landing | Fuente cruda inmutable. Base para reprocesamiento. |
 | Bronze | Tipificación explícita (sin inferencia), columnas técnicas, dedupe por clave natural. Sin lógica de negocio. |
-| Silver | Conformado v1/v2, join de enriquecimiento con orgs, features analíticas, reglas de calidad + quarantine, flags de anomalía (z-score, MAD, p-tiles). |
+| Silver | Conformado v1/v2, join de enriquecimiento con orgs, features analíticas, reglas de calidad + quarantine, flag de anomalía. |
 | Gold | Marts agregados listos para serving. Sin joins en tiempo de consulta. |
 | Serving | Cassandra/AstraDB query-first, baja latencia. |
 
@@ -453,35 +352,12 @@ Tres reglas activas en la transición Bronze→Silver:
 - **R3** `value IS NOT NULL AND unit IS NULL` → **quarantine** (unit inconsistente).
   1 978 filas en quarantine, todas etiquetadas `dq_rule = unit_missing_with_value`.
 
-**Anomalía estadística — tres métodos por servicio.** La consigna ofrece tres
-métodos "a elección" (z-score, MAD, p-tiles); los implementamos **los tres** y cada
-uno vota por separado, más la regla de negocio R2. Todos se calculan por `service`,
-porque un evento de `genai` cuesta naturalmente más que uno de `networking` y un
-umbral global mezclaría distribuciones distintas.
-
-| Método | Regla | Umbral | Por qué |
-|---|---|---|---|
-| **z-score** | `\|x − media\| / desvío` | > 3 | Clásico; sensible pero se distorsiona con los mismos outliers que busca. |
-| **MAD** (z modificado) | `0.6745 · \|x − mediana\| / MAD` | > 3.5 | Robusto a outliers. `null` cuando `MAD = 0` (servicio degenerado). |
-| **p-tiles** | fuera de `[p01, p99]` | banda por servicio | Libre de distribución; no asume normalidad. |
-| **negative** (R2) | `cost_usd_increment < −0.01` | −0.01 | Regla de negocio: costo negativo. `-0.01` (no `0`) tolera ruido de float. |
-
-**Regla de consenso.** Las distribuciones de costo por servicio son muy sesgadas a
-la derecha, así que un método suelto (sobre todo MAD) marca toda la cola superior
-(la unión de los tres da ~30% de los eventos, demasiado para llamarlo "anomalía").
-Por eso la marca final exige **consenso**:
-
-```
-cost_anomaly_flag = (≥ 2 de {z-score, MAD, p-tiles} coinciden) OR negative
-```
-
-El costo negativo (R2) marca por sí solo: es una señal de negocio dura, no una
-conjetura estadística. Esto es lo que hace que valga la pena correr tres métodos —
-el valor está en la **coincidencia**, no en la unión. En Silver quedan las columnas
-por método (`score_<m>`, `flag_<m>`) que alimentan el mart `cost_anomaly_by_org_date`:
-ahí el set `methods` lista qué detectores coincidieron, el map `scores` guarda cuán
-fuerte fue cada uno, y `anomaly_score` = máximo entre métodos, para ordenar las
-peores anomalías primero.
+**Anomalía estadística**: `cost_usd` fuera de los percentiles **01/99** por
+servicio también se marca. El percentil por servicio se adapta a la distribución
+de costos de cada tipo de servicio (un evento de `genai` cuesta naturalmente más
+que uno de `networking`), cosa que un umbral fijo no haría. Combinada con R2, 624
+de 41 222 filas Silver llevan `cost_anomaly_flag`. Umbral `-0.01` (no `0`) tolera
+el ruido de punto flotante.
 
 ### Evolución de esquema (v1 / v2)
 
@@ -494,23 +370,12 @@ fabrica). No hay bifurcación de lógica ni pipelines separados por versión.
 
 ### Cassandra (AstraDB) — claves query-first
 
-Seis tablas, modeladas por consulta (query-first):
+Dos tablas, una por consulta obligatoria:
 
 | Tabla | Primary Key | Sirve |
 |---|---|---|
 | `org_daily_usage_by_service` | `((org_id), event_date, service)` | Consulta #1: partición por org, range-slice sobre la columna de clustering `event_date`. |
 | `org_service_cost_14d` | `((org_id), total_cost_usd, service)` con `CLUSTERING ORDER BY (total_cost_usd DESC)` | Consulta #2: `WHERE org_id=? LIMIT n` devuelve el top-N directo, sin sort del lado del cliente. |
-| `tickets_by_org_date` | `((org_id), event_date, severity)` con `CLUSTERING ORDER BY (event_date DESC)` | Consulta #3: tickets + tasa de SLA breach por día; los días recientes llegan primero. |
-| `revenue_by_org_month` | `((org_id), month)` con `CLUSTERING ORDER BY (month DESC)` | Consulta #4: revenue mensual normalizado a USD; el mes más reciente primero. |
-| `genai_tokens_by_org_date` | `((org_id), event_date)` con `CLUSTERING ORDER BY (event_date DESC)` | Consulta #5: tokens GenAI y costo por día. |
-| `cost_anomaly_by_org_date` | `((org_id), anomaly_score, event_date, service)` con `CLUSTERING ORDER BY (anomaly_score DESC)` | Consulta extra: peores anomalías de costo primero; usa **colecciones** `methods set<text>` + `scores map<text,double>`. |
-
-> **Colecciones de Cassandra.** El mart de anomalías usa dos colecciones —
-> `methods set<text>` (qué detectores dispararon) y `scores map<text,double>`
-> (score por método)— para modelar la evidencia multi-método sin columnas
-> dispersas. Es el uso idiomático de `set`/`map` de CQL. (Una extensión posible es
-> un `metrics map<text,double>` en el mart diario para volver el metric-bag
-> extensible; hoy ese mart mantiene columnas escalares por simplicidad de consulta.)
 
 Carga vía el `cassandra-driver` de Python (no el conector de Spark, cuyo soporte
 para Spark 4.0 / Scala 2.13 va atrasado). Desarrollo contra Cassandra en Docker;
@@ -521,13 +386,11 @@ evidencia final capturada contra AstraDB vía el switch `SERVING_TARGET`.
 - **Eventos Bronze**: checkpoint de streaming — re-ejecutar reanuda desde los
   offsets confirmados, así ningún evento se reprocesa.
 - **Maestros / Silver / Gold**: `mode("overwrite")`.
-- **Tablas Cassandra por PK natural** (`daily`, `tickets`, `revenue`, `genai`):
-  upsert por primary key (sobrescribe in place).
-- **Tablas 14d y de anomalías**: su primary key incluye un valor de medida
-  (`total_cost_usd` / `anomaly_score`) para servir el top-N por clustering, así que
-  un valor cambiado en una re-ejecución insertaría una fila *nueva* y dejaría
-  huérfana la vieja. Como son snapshots completos, hacemos **truncate-y-recarga**
-  para mantenerlas idempotentes.
+- **Tabla daily de Cassandra**: upsert por primary key (sobrescribe in place).
+- **Tabla 14d de Cassandra**: su primary key incluye `total_cost_usd`, así que un
+  valor cambiado en una re-ejecución insertaría una fila *nueva* y dejaría huérfana
+  la vieja. Como es un snapshot completo, hacemos **truncate-y-recarga** para
+  mantenerla idempotente.
 
 **Lección aprendida (bug corregido):** los maestros se escriben con
 `ingest_date=current_date()` bajo `partitionOverwriteMode=dynamic`. Correr en dos
@@ -570,68 +433,3 @@ permite el top-N nativo con `LIMIT N`. Sirve la consulta #2.
 | `total_cost_usd` | double | Costo acumulado en los últimos 14 días (clustering key DESC) |
 | `service` | text | Tipo de servicio (clustering key ASC) |
 | `org_name` | text | Nombre de la org (enriquecimiento) |
-
-### `tickets_by_org_date`
-
-Mart de Soporte con grano org × severidad × día de creación del ticket. Fuente:
-maestro `support_tickets`. Sirve la consulta #3.
-
-| Campo | Tipo | Descripción |
-|---|---|---|
-| `org_id` | text | Identificador de la organización (partition key) |
-| `event_date` | date | Fecha de creación del ticket (clustering key DESC) |
-| `severity` | text | Severidad del ticket (clustering key ASC): `low`, `medium`, `high`, `critical` |
-| `ticket_count` | bigint | Cantidad de tickets en el grupo |
-| `sla_breach_count` | bigint | Tickets con SLA incumplido |
-| `sla_breach_rate` | double | `sla_breach_count / ticket_count` |
-| `avg_csat` | double | CSAT promedio (`null` si ningún ticket del grupo tiene CSAT) |
-
-### `revenue_by_org_month`
-
-Mart FinOps de facturación con grano org × mes. Fuente: maestro `billing_monthly`.
-Sirve la consulta #4.
-
-| Campo | Tipo | Descripción |
-|---|---|---|
-| `org_id` | text | Identificador de la organización (partition key) |
-| `month` | date | Mes facturado (clustering key DESC) |
-| `revenue_usd` | double | `(subtotal − credits + taxes) × exchange_rate_to_usd`, normalizado a USD |
-| `subtotal` | double | Subtotal en moneda original |
-| `credits` | double | Créditos aplicados (`0` si no hay) |
-| `taxes` | double | Impuestos aplicados |
-| `currency` | text | Moneda original de la factura |
-
-### `genai_tokens_by_org_date`
-
-Mart de Producto/GenAI con grano org × día, solo eventos de `service = 'genai'`.
-Fuente: Silver. Sirve la consulta #5.
-
-| Campo | Tipo | Descripción |
-|---|---|---|
-| `org_id` | text | Identificador de la organización (partition key) |
-| `event_date` | date | Fecha del evento (clustering key DESC) |
-| `total_tokens` | bigint | Tokens GenAI consumidos en la fecha |
-| `cost_usd` | double | Costo estimado en USD |
-| `event_count` | bigint | Cantidad de eventos GenAI en el grupo |
-
-### `cost_anomaly_by_org_date`
-
-Mart FinOps de anomalías con grano org × servicio × día; solo grupos con al menos
-un evento marcado. Fuente: Silver (scores/flags de los 3 métodos). Sirve la consulta
-extra de anomalías.
-
-| Campo | Tipo | Descripción |
-|---|---|---|
-| `org_id` | text | Identificador de la organización (partition key) |
-| `anomaly_score` | double | Máximo score entre métodos (clustering key DESC) — ordena "peores primero" |
-| `event_date` | date | Fecha del evento (clustering key DESC) |
-| `service` | text | Tipo de servicio (clustering key ASC) |
-| `methods` | **set\<text\>** | Colección: detectores que dispararon (`zscore`, `mad`, `ptiles`, `negative`) |
-| `scores` | **map\<text,double\>** | Colección: score más fuerte por método que disparó (solo aparecen los métodos que dispararon) |
-| `event_count` | bigint | Cantidad de eventos anómalos en el grupo |
-| `org_name` | text | Nombre de la org (enriquecimiento) |
-
-Ejemplo de una fila: `methods = {'zscore','mad','ptiles'}`,
-`scores = {'zscore': 23.56, 'mad': 122.47, 'ptiles': 209.66}`. Modelarlo como
-colecciones evita cuatro columnas `score_*` casi siempre en `null` (una por método)
-y mantiene la tabla extensible si se agrega un cuarto detector.
