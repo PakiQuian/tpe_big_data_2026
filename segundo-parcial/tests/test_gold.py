@@ -184,9 +184,9 @@ def test_gold_cost_anomaly_scores_per_method(spark):
 
     assert ("storage", d) not in out  # only flagged groups make the mart
     g = out[("compute", d)]
-    assert set(g["methods"].split(",")) == {"zscore", "ptiles"}  # detectors that fired
-    assert g["score_zscore"] == 8.0  # strongest score per method
-    assert g["score_ptiles"] == 2.0
-    assert g["score_mad"] is None  # method that never fired stays null
+    assert set(g["methods"]) == {"zscore", "ptiles"}  # set collection of detectors
+    assert g["scores"]["zscore"] == 8.0  # map keeps the strongest score per method
+    assert g["scores"]["ptiles"] == 2.0
+    assert "mad" not in g["scores"]  # method that never fired is absent from the map
     assert g["anomaly_score"] == 8.0  # max across methods
     assert g["event_count"] == 2

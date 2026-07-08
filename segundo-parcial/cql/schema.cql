@@ -76,19 +76,17 @@ CREATE TABLE IF NOT EXISTS genai_tokens_by_org_date (
 
 -- Table 6: the FinOps cost_anomaly_mart — flagged cost anomalies per org/service
 -- /day, scored by three methods (z-score, MAD, p-tiles) plus the negative-cost
--- business rule. `methods` lists the detectors that fired; each score_* column is
--- that method's strongest score (null when it did not fire). Cluster by
--- anomaly_score DESC so the worst anomalies for an org surface first.
+-- business rule. Two Cassandra COLLECTIONS carry the multi-method evidence:
+-- `methods set<text>` (which detectors fired) and `scores map<text,double>` (how
+-- strong each was). Cluster by anomaly_score DESC so the worst anomalies surface
+-- first.
 CREATE TABLE IF NOT EXISTS cost_anomaly_by_org_date (
     org_id text,
     anomaly_score double,
     event_date date,
     service text,
-    methods text,
-    score_zscore double,
-    score_mad double,
-    score_ptiles double,
-    score_negative double,
+    methods set<text>,
+    scores map<text, double>,
     event_count bigint,
     org_name text,
     PRIMARY KEY ((org_id), anomaly_score, event_date, service)

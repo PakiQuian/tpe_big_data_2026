@@ -460,39 +460,43 @@ def build_gold_cost_anomaly(silver: DataFrame) -> DataFrame:
     """FinOps mart `cost_anomaly_by_org_date`: grain org × service × day.
 
     Keeps only the flagged events (the mart *is* the anomalies) and rolls them up
-    per org/service/day. For each detection method it keeps the strongest score
-    seen among the events that method flagged (``score_<method>``, null when the
-    method never fired in the group). ``methods`` is a comma-joined list of the
-    detectors that fired, and ``anomaly_score`` the max across methods — a single
-    sortable number that orders the serving table.
+    per org/service/day, emitting two Cassandra **collections** plus a headline
+    score:
+
+    - ``scores`` (``map<string,double>`` → Cassandra ``map<text,double>``): the
+      strongest score seen per method that fired. Modelling this as a map avoids
+      one sparse ``score_<method>`` column per method (mostly nulls), and stays
+      extensible if a fourth detector is added.
+    - ``methods`` (``array<string>`` → Cassandra ``set<text>``): the detectors
+      that fired — derived from the map keys, so set and map never disagree.
+    - ``anomaly_score``: the max score across methods — a single sortable number
+      that orders the serving table (worst first).
+
+    Only methods that actually fired appear in ``scores`` / ``methods``.
     """
     flagged = silver.filter(F.col("cost_anomaly_flag"))
     agg = flagged.groupBy("org_id", "service", "event_date").agg(
         *[
-            F.max(F.when(F.col(f"flag_{m}"), F.col(f"score_{m}"))).alias(f"score_{m}")
+            F.max(F.when(F.col(f"flag_{m}"), F.col(f"score_{m}"))).alias(f"m_{m}")
             for m in ANOMALY_METHODS
         ],
         F.count(F.lit(1)).alias("event_count"),
         F.first("org_name", ignorenulls=True).alias("org_name"),
     )
-    # `methods`: comma-joined names of the detectors that fired (score non-null).
-    methods = F.concat_ws(
-        ",",
-        F.array_compact(
-            F.array(
-                *[
-                    F.when(F.col(f"score_{m}").isNotNull(), F.lit(m))
-                    for m in ANOMALY_METHODS
-                ]
-            )
-        ),
+    # Build a full {method: max_score} map (fixed keys, some null values), then
+    # drop the null-valued entries so only methods that fired remain. `methods`
+    # comes from the surviving keys, keeping the set and map consistent.
+    full_map = F.create_map(
+        *[x for m in ANOMALY_METHODS for x in (F.lit(m), F.col(f"m_{m}"))]
     )
+    scores = F.map_filter(full_map, lambda _k, v: v.isNotNull())
     return (
-        agg.withColumn("methods", methods)
+        agg.withColumn("scores", scores)
+        .withColumn("methods", F.map_keys(scores))
         .withColumn(
             "anomaly_score",
             F.greatest(
-                *[F.coalesce(F.col(f"score_{m}"), F.lit(0.0)) for m in ANOMALY_METHODS]
+                *[F.coalesce(F.col(f"m_{m}"), F.lit(0.0)) for m in ANOMALY_METHODS]
             ),
         )
         .select(
@@ -501,7 +505,7 @@ def build_gold_cost_anomaly(silver: DataFrame) -> DataFrame:
             "service",
             "anomaly_score",
             "methods",
-            *[f"score_{m}" for m in ANOMALY_METHODS],
+            "scores",
             "event_count",
             "org_name",
         )

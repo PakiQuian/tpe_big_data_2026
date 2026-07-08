@@ -101,20 +101,18 @@ CREATE TABLE IF NOT EXISTS {GENAI_TABLE} (
 
 # Table 6 — the FinOps `cost_anomaly_mart`: flagged cost anomalies per org/service
 # /day, scored by three methods (z-score, MAD, p-tiles) plus the negative-cost
-# business rule. `methods` is a comma-joined list of the detectors that fired and
-# each `score_*` column its strongest score (null where the method did not fire).
-# Clustered by anomaly_score DESC so the worst anomalies for an org surface first.
+# business rule. Two COLLECTIONS carry the multi-method evidence: `methods
+# set<text>` (which detectors fired) and `scores map<text,double>` (how strong
+# each was) — no sparse per-method columns. Clustered by anomaly_score DESC so the
+# worst anomalies for an org surface first.
 CREATE_ANOMALY = f"""
 CREATE TABLE IF NOT EXISTS {ANOMALY_TABLE} (
     org_id text,
     anomaly_score double,
     event_date date,
     service text,
-    methods text,
-    score_zscore double,
-    score_mad double,
-    score_ptiles double,
-    score_negative double,
+    methods set<text>,
+    scores map<text, double>,
     event_count bigint,
     org_name text,
     PRIMARY KEY ((org_id), anomaly_score, event_date, service)
@@ -345,9 +343,8 @@ def upsert_cost_anomaly(session, rows, truncate=True):
         session.execute(f"TRUNCATE {ANOMALY_TABLE}")
     stmt = session.prepare(
         f"INSERT INTO {ANOMALY_TABLE} "
-        "(org_id, anomaly_score, event_date, service, methods, "
-        "score_zscore, score_mad, score_ptiles, score_negative, event_count, org_name) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+        "(org_id, anomaly_score, event_date, service, methods, scores, event_count, org_name) "
+        "VALUES (?,?,?,?,?,?,?,?)"
     )
     params = [
         (
@@ -355,11 +352,8 @@ def upsert_cost_anomaly(session, rows, truncate=True):
             _f(r["anomaly_score"]),
             r["event_date"],
             r["service"],
-            r["methods"],
-            _f(r["score_zscore"]),
-            _f(r["score_mad"]),
-            _f(r["score_ptiles"]),
-            _f(r["score_negative"]),
+            set(r["methods"]) if r["methods"] is not None else set(),
+            {k: float(v) for k, v in (r["scores"] or {}).items()},
             r["event_count"],
             r["org_name"],
         )
@@ -373,12 +367,11 @@ def query_top_anomalies(session, org_id, n):
     """Extra query: top-N cost anomalies for an org, worst score first.
 
     Clustering by anomaly_score DESC makes `WHERE org_id=? LIMIT n` return the
-    strongest anomalies directly; `methods` lists which detectors agreed and the
-    `score_*` columns how strong each signal was.
+    strongest anomalies directly; the `methods` set lists which detectors agreed
+    and the `scores` map how strong each signal was.
     """
     stmt = session.prepare(
-        f"SELECT org_id, event_date, service, anomaly_score, methods, "
-        f"score_zscore, score_mad, score_ptiles, score_negative, event_count "
+        f"SELECT org_id, event_date, service, anomaly_score, methods, scores, event_count "
         f"FROM {ANOMALY_TABLE} WHERE org_id=? LIMIT ?"
     )
     return list(session.execute(stmt, (org_id, n)))

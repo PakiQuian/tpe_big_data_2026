@@ -46,10 +46,9 @@ WHERE org_id = 'org_kdgigatj'
 
 -- Query extra: top cost anomalies for an org, worst first. Clustering by
 -- anomaly_score DESC makes LIMIT return the strongest anomalies directly.
--- `methods` shows which detectors agreed (z-score / MAD / p-tiles / negative)
--- and each score_* how strong that signal was.
-SELECT org_id, event_date, service, anomaly_score, methods,
-       score_zscore, score_mad, score_ptiles, score_negative
+-- `methods` (set) shows which detectors agreed (z-score / MAD / p-tiles /
+-- negative) and `scores` (map) how strong each signal was.
+SELECT org_id, event_date, service, anomaly_score, methods, scores
 FROM cost_anomaly_by_org_date
 WHERE org_id = 'org_0lvsnujz'
 LIMIT 10;

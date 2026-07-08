@@ -420,7 +420,8 @@ print("gold cost-anomaly rows:", gold_anomaly.count())
 # - `tickets_by_org_date` — consulta #3 (tickets + SLA por día).
 # - `revenue_by_org_month` — consulta #4 (revenue mensual en USD).
 # - `genai_tokens_by_org_date` — consulta #5 (tokens GenAI por día).
-# - `cost_anomaly_by_org_date` — consulta extra de anomalías (score por método, multi-método).
+# - `cost_anomaly_by_org_date` — consulta extra de anomalías; usa colecciones
+#   (`methods set<text>` + `scores map<text,double>`).
 
 # %%
 import serving
@@ -527,19 +528,20 @@ for row in q5_rows[:10]:
 # %% [markdown]
 # ## Consulta extra — top anomalías de costo por org (multi-método)
 #
-# Sobre `cost_anomaly_by_org_date`. `methods` dice qué detectores coincidieron
-# (z-score / MAD / p-tiles / negative) y cada `score_*` cuán fuerte fue ese método.
-# El clustering por `anomaly_score DESC` devuelve las peores anomalías con un LIMIT.
+# Sobre `cost_anomaly_by_org_date`, que usa **colecciones**: `methods` (set) dice
+# qué detectores coincidieron y `scores` (map) cuán fuerte fue cada uno. El
+# clustering por `anomaly_score DESC` devuelve las peores anomalías con un LIMIT.
 
 # %%
 anomaly_org = gold_anomaly.agg(F.first("org_id")).collect()[0][0]
 qa_rows = serving.query_top_anomalies(session, anomaly_org, 10)
 print(f"\nQuery anomalías — top {len(qa_rows)} para org={anomaly_org}:")
 for row in qa_rows:
+    methods = ",".join(sorted(row.methods)) if row.methods else "-"
+    scores = {k: round(v, 2) for k, v in (row.scores or {}).items()}
     print(
         f"  {row.event_date}  {row.service:<12} score={row.anomaly_score:7.2f}  "
-        f"methods=[{row.methods}]  z={row.score_zscore}  mad={row.score_mad}  "
-        f"ptiles={row.score_ptiles}"
+        f"methods={{{methods}}}  scores={scores}"
     )
 
 # %% [markdown]

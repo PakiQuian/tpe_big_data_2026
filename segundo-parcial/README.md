@@ -331,9 +331,9 @@ tienen costo — el conformado v1/v2 no fabrica tokens.
 
 **Consulta extra — top anomalías de costo (multi-método)**
 
-`org_0lvsnujz`, peores primero. Se ve el **consenso**: las anomalías más fuertes
-las marcan los tres métodos (`zscore,mad,ptiles`), y la regla `negative` aparece
-cuando además hay costo negativo.
+`org_0lvsnujz`, peores primero. Se ve el **consenso** y las **colecciones**: el set
+`methods` marca los detectores que coincidieron (`{zscore,mad,ptiles}`) y el map
+`scores` el peso de cada uno; `negative` aparece cuando además hay costo negativo.
 
 ![Consulta anomalías — top multi-método](evidence/astra/query_anomalies_top.png)
 
@@ -479,8 +479,9 @@ El costo negativo (R2) marca por sí solo: es una señal de negocio dura, no una
 conjetura estadística. Esto es lo que hace que valga la pena correr tres métodos —
 el valor está en la **coincidencia**, no en la unión. En Silver quedan las columnas
 por método (`score_<m>`, `flag_<m>`) que alimentan el mart `cost_anomaly_by_org_date`:
-ahí `methods` lista qué detectores coincidieron, cada `score_*` cuán fuerte fue, y
-`anomaly_score` = máximo entre métodos, para ordenar las peores anomalías primero.
+ahí el set `methods` lista qué detectores coincidieron, el map `scores` guarda cuán
+fuerte fue cada uno, y `anomaly_score` = máximo entre métodos, para ordenar las
+peores anomalías primero.
 
 ### Evolución de esquema (v1 / v2)
 
@@ -502,13 +503,14 @@ Seis tablas, modeladas por consulta (query-first):
 | `tickets_by_org_date` | `((org_id), event_date, severity)` con `CLUSTERING ORDER BY (event_date DESC)` | Consulta #3: tickets + tasa de SLA breach por día; los días recientes llegan primero. |
 | `revenue_by_org_month` | `((org_id), month)` con `CLUSTERING ORDER BY (month DESC)` | Consulta #4: revenue mensual normalizado a USD; el mes más reciente primero. |
 | `genai_tokens_by_org_date` | `((org_id), event_date)` con `CLUSTERING ORDER BY (event_date DESC)` | Consulta #5: tokens GenAI y costo por día. |
-| `cost_anomaly_by_org_date` | `((org_id), anomaly_score, event_date, service)` con `CLUSTERING ORDER BY (anomaly_score DESC)` | Consulta extra: peores anomalías de costo primero; `methods` + `score_*` por método. |
+| `cost_anomaly_by_org_date` | `((org_id), anomaly_score, event_date, service)` con `CLUSTERING ORDER BY (anomaly_score DESC)` | Consulta extra: peores anomalías de costo primero; usa **colecciones** `methods set<text>` + `scores map<text,double>`. |
 
-> **Colecciones (pendiente).** La consigna del proyecto completo pide "todos los
-> datos en un Keyspace de Cassandra **utilizando colecciones**". Hoy el modelo es
-> escalar; la conversión a colecciones (`metrics map<text,double>` en el mart
-> diario, `methods set<text>` + `scores map<text,double>` en el de anomalías) está
-> planificada como próximo paso.
+> **Colecciones de Cassandra.** El mart de anomalías usa dos colecciones —
+> `methods set<text>` (qué detectores dispararon) y `scores map<text,double>`
+> (score por método)— para modelar la evidencia multi-método sin columnas
+> dispersas. Es el uso idiomático de `set`/`map` de CQL. (Una extensión posible es
+> un `metrics map<text,double>` en el mart diario para volver el metric-bag
+> extensible; hoy ese mart mantiene columnas escalares por simplicidad de consulta.)
 
 Carga vía el `cassandra-driver` de Python (no el conector de Spark, cuyo soporte
 para Spark 4.0 / Scala 2.13 va atrasado). Desarrollo contra Cassandra en Docker;
@@ -624,10 +626,12 @@ extra de anomalías.
 | `anomaly_score` | double | Máximo score entre métodos (clustering key DESC) — ordena "peores primero" |
 | `event_date` | date | Fecha del evento (clustering key DESC) |
 | `service` | text | Tipo de servicio (clustering key ASC) |
-| `methods` | text | Detectores que dispararon, separados por coma (`zscore`, `mad`, `ptiles`, `negative`) |
-| `score_zscore` | double | Score z-score más fuerte del grupo (`null` si no disparó) |
-| `score_mad` | double | Score MAD (z modificado) más fuerte (`null` si no disparó) |
-| `score_ptiles` | double | Distancia fuera de la banda `[p01, p99]` (`null` si no disparó) |
-| `score_negative` | double | Magnitud del costo negativo (`null` si no aplica) |
+| `methods` | **set\<text\>** | Colección: detectores que dispararon (`zscore`, `mad`, `ptiles`, `negative`) |
+| `scores` | **map\<text,double\>** | Colección: score más fuerte por método que disparó (solo aparecen los métodos que dispararon) |
 | `event_count` | bigint | Cantidad de eventos anómalos en el grupo |
 | `org_name` | text | Nombre de la org (enriquecimiento) |
+
+Ejemplo de una fila: `methods = {'zscore','mad','ptiles'}`,
+`scores = {'zscore': 23.56, 'mad': 122.47, 'ptiles': 209.66}`. Modelarlo como
+colecciones evita cuatro columnas `score_*` casi siempre en `null` (una por método)
+y mantiene la tabla extensible si se agrega un cuarto detector.
