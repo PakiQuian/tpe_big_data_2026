@@ -318,3 +318,67 @@ def build_cost_14d(
         F.sum("cost_usd").alias("total_cost_usd"),
         F.first("org_name", ignorenulls=True).alias("org_name"),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Gold pure transforms — Soporte, FinOps revenue, Producto/GenAI.
+# --------------------------------------------------------------------------- #
+
+
+def build_gold_tickets(tickets: DataFrame) -> DataFrame:
+    """Support mart `tickets_by_org_date`: grain org × severity × day.
+
+    `event_date` is the ticket creation date. SLA breach rate = breached / total.
+    `sla_breached` is boolean → cast to int for safe summing (nulls → 0).
+    """
+    return (
+        tickets.withColumn("event_date", F.col("created_at"))
+        .withColumn("sla_int", F.coalesce(F.col("sla_breached").cast("int"), F.lit(0)))
+        .groupBy("org_id", "event_date", "severity")
+        .agg(
+            F.count(F.lit(1)).alias("ticket_count"),
+            F.sum("sla_int").alias("sla_breach_count"),
+            (F.sum("sla_int") / F.count(F.lit(1))).alias("sla_breach_rate"),
+            F.avg("csat").alias("avg_csat"),
+        )
+    )
+
+
+def build_gold_revenue(billing: DataFrame) -> DataFrame:
+    """FinOps mart `revenue_by_org_month`: grain org × month.
+
+    revenue_usd = (subtotal − credits + taxes) × exchange_rate_to_usd.
+    credits can be null (no credits applied) → coalesced to 0.
+    """
+    return billing.select(
+        "org_id",
+        "month",
+        (
+            (
+                F.col("subtotal")
+                - F.coalesce(F.col("credits"), F.lit(0.0))
+                + F.coalesce(F.col("taxes"), F.lit(0.0))
+            )
+            * F.col("exchange_rate_to_usd")
+        ).alias("revenue_usd"),
+        "subtotal",
+        F.coalesce(F.col("credits"), F.lit(0.0)).alias("credits"),
+        F.coalesce(F.col("taxes"), F.lit(0.0)).alias("taxes"),
+        "currency",
+    )
+
+
+def build_gold_genai(silver: DataFrame) -> DataFrame:
+    """Producto mart `genai_tokens_by_org_date`: grain org × day, genai only.
+
+    Aggregates token consumption and cost for GenAI service events.
+    """
+    return (
+        silver.filter(F.col("service") == "genai")
+        .groupBy("org_id", "event_date")
+        .agg(
+            F.sum("genai_tokens").alias("total_tokens"),
+            F.sum("cost_usd").alias("cost_usd"),
+            F.count(F.lit(1)).alias("event_count"),
+        )
+    )

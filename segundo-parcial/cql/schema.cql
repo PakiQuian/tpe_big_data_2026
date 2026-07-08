@@ -36,3 +36,40 @@ CREATE TABLE IF NOT EXISTS org_service_cost_14d (
     org_name text,
     PRIMARY KEY ((org_id), total_cost_usd, service)
 ) WITH CLUSTERING ORDER BY (total_cost_usd DESC, service ASC);
+
+-- Table 3: serves business query #3 — ticket evolution + SLA breach rate by day
+-- (last 30 days). Cluster by event_date DESC so recent days come first.
+CREATE TABLE IF NOT EXISTS tickets_by_org_date (
+    org_id text,
+    event_date date,
+    severity text,
+    ticket_count bigint,
+    sla_breach_count bigint,
+    sla_breach_rate double,
+    avg_csat double,
+    PRIMARY KEY ((org_id), event_date, severity)
+) WITH CLUSTERING ORDER BY (event_date DESC, severity ASC);
+
+-- Table 4: serves business query #4 — monthly revenue with credits/taxes
+-- normalised to USD. Cluster by month DESC so most recent month comes first.
+CREATE TABLE IF NOT EXISTS revenue_by_org_month (
+    org_id text,
+    month date,
+    revenue_usd double,
+    subtotal double,
+    credits double,
+    taxes double,
+    currency text,
+    PRIMARY KEY ((org_id), month)
+) WITH CLUSTERING ORDER BY (month DESC);
+
+-- Table 5: serves business query #5 — GenAI token consumption and estimated cost
+-- per day. Cluster by event_date DESC.
+CREATE TABLE IF NOT EXISTS genai_tokens_by_org_date (
+    org_id text,
+    event_date date,
+    total_tokens bigint,
+    cost_usd double,
+    event_count bigint,
+    PRIMARY KEY ((org_id), event_date)
+) WITH CLUSTERING ORDER BY (event_date DESC);
