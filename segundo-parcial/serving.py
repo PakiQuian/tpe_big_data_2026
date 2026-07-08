@@ -20,6 +20,7 @@ COST_14D_TABLE = "org_service_cost_14d"
 TICKETS_TABLE = "tickets_by_org_date"
 REVENUE_TABLE = "revenue_by_org_month"
 GENAI_TABLE = "genai_tokens_by_org_date"
+ANOMALY_TABLE = "cost_anomaly_by_org_date"
 
 # Table 1 — query-first for business query #1 (daily cost+requests by org+service
 # over a date range): partition by org, cluster by (event_date, service).
@@ -98,6 +99,28 @@ CREATE TABLE IF NOT EXISTS {GENAI_TABLE} (
 ) WITH CLUSTERING ORDER BY (event_date DESC)
 """
 
+# Table 6 — the FinOps `cost_anomaly_mart`: flagged cost anomalies per org/service
+# /day, scored by three methods (z-score, MAD, p-tiles) plus the negative-cost
+# business rule. `methods` is a comma-joined list of the detectors that fired and
+# each `score_*` column its strongest score (null where the method did not fire).
+# Clustered by anomaly_score DESC so the worst anomalies for an org surface first.
+CREATE_ANOMALY = f"""
+CREATE TABLE IF NOT EXISTS {ANOMALY_TABLE} (
+    org_id text,
+    anomaly_score double,
+    event_date date,
+    service text,
+    methods text,
+    score_zscore double,
+    score_mad double,
+    score_ptiles double,
+    score_negative double,
+    event_count bigint,
+    org_name text,
+    PRIMARY KEY ((org_id), anomaly_score, event_date, service)
+) WITH CLUSTERING ORDER BY (anomaly_score DESC, event_date DESC, service ASC)
+"""
+
 
 def connect(
     target,
@@ -137,6 +160,7 @@ def create_tables(session):
     session.execute(CREATE_TICKETS)
     session.execute(CREATE_REVENUE)
     session.execute(CREATE_GENAI)
+    session.execute(CREATE_ANOMALY)
 
 
 def _f(x):
@@ -307,3 +331,54 @@ def query_genai_by_org(session, org_id, start_date):
         f"FROM {GENAI_TABLE} WHERE org_id=? AND event_date>=?"
     )
     return list(session.execute(stmt, (org_id, start_date)))
+
+
+def upsert_cost_anomaly(session, rows, truncate=True):
+    """(Re)load the cost-anomaly mart.
+
+    Like the 14-day rollup, the primary key includes ``anomaly_score`` (so the
+    clustering order serves "worst anomalies first"). A changed score on re-run
+    would therefore insert a NEW row instead of overwriting; the table is a full
+    snapshot, so we TRUNCATE before loading to stay idempotent.
+    """
+    if truncate:
+        session.execute(f"TRUNCATE {ANOMALY_TABLE}")
+    stmt = session.prepare(
+        f"INSERT INTO {ANOMALY_TABLE} "
+        "(org_id, anomaly_score, event_date, service, methods, "
+        "score_zscore, score_mad, score_ptiles, score_negative, event_count, org_name) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+    )
+    params = [
+        (
+            r["org_id"],
+            _f(r["anomaly_score"]),
+            r["event_date"],
+            r["service"],
+            r["methods"],
+            _f(r["score_zscore"]),
+            _f(r["score_mad"]),
+            _f(r["score_ptiles"]),
+            _f(r["score_negative"]),
+            r["event_count"],
+            r["org_name"],
+        )
+        for r in rows
+    ]
+    execute_concurrent_with_args(session, stmt, params, concurrency=32)
+    return len(params)
+
+
+def query_top_anomalies(session, org_id, n):
+    """Extra query: top-N cost anomalies for an org, worst score first.
+
+    Clustering by anomaly_score DESC makes `WHERE org_id=? LIMIT n` return the
+    strongest anomalies directly; `methods` lists which detectors agreed and the
+    `score_*` columns how strong each signal was.
+    """
+    stmt = session.prepare(
+        f"SELECT org_id, event_date, service, anomaly_score, methods, "
+        f"score_zscore, score_mad, score_ptiles, score_negative, event_count "
+        f"FROM {ANOMALY_TABLE} WHERE org_id=? LIMIT ?"
+    )
+    return list(session.execute(stmt, (org_id, n)))

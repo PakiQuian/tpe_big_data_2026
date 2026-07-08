@@ -36,7 +36,20 @@ WHERE org_id = 'org_0lvsnujz';
 
 -- Query #5: GenAI token consumption and estimated cost per day.
 -- event_date DESC delivers most recent days first.
+-- NOTE: not every org uses the `genai` service (the consigna says "si existen"),
+-- so this query targets an org with GenAI activity. org_0lvsnujz, used by the
+-- other queries, has no GenAI usage and would return 0 rows here.
 SELECT org_id, event_date, total_tokens, cost_usd, event_count
 FROM genai_tokens_by_org_date
-WHERE org_id = 'org_0lvsnujz'
+WHERE org_id = 'org_kdgigatj'
   AND event_date >= '2025-07-01';
+
+-- Query extra: top cost anomalies for an org, worst first. Clustering by
+-- anomaly_score DESC makes LIMIT return the strongest anomalies directly.
+-- `methods` shows which detectors agreed (z-score / MAD / p-tiles / negative)
+-- and each score_* how strong that signal was.
+SELECT org_id, event_date, service, anomaly_score, methods,
+       score_zscore, score_mad, score_ptiles, score_negative
+FROM cost_anomaly_by_org_date
+WHERE org_id = 'org_0lvsnujz'
+LIMIT 10;

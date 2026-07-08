@@ -10,11 +10,13 @@
 #    (Structured Streaming), con columnas técnicas de auditoría.
 # 2. **Silver** — conformance v1/v2, enriquecimiento con dimensiones, features de
 #    costo/uso, reglas de calidad con quarantine y flags de anomalía.
-# 3. **Gold** — cinco marts: `org_daily_usage_by_service` (FinOps diario), rollup de
+# 3. **Gold** — seis marts: `org_daily_usage_by_service` (FinOps diario), rollup de
 #    costo a 14 días, `tickets_by_org_date` (Soporte), `revenue_by_org_month`
-#    (FinOps revenue) y `genai_tokens_by_org_date` (Producto/GenAI).
-# 4. **Serving** — cinco tablas Cassandra modeladas *query-first* que responden las
-#    cinco consultas de negocio obligatorias (#1–#5).
+#    (FinOps revenue), `genai_tokens_by_org_date` (Producto/GenAI) y
+#    `cost_anomaly_by_org_date` (FinOps anomalías, multi-método).
+# 4. **Serving** — seis tablas Cassandra modeladas *query-first* que responden las
+#    cinco consultas de negocio obligatorias (#1–#5) más una consulta extra de
+#    anomalías de costo.
 #
 # El patrón es Lambda acotado al MVP: el streaming cubre landing→Bronze y el resto
 # corre como batch sobre el Parquet de Bronze. El detalle de cada decisión está en
@@ -391,13 +393,34 @@ gold_genai = spark.read.parquet(str(GOLD / "genai_tokens_by_org_date"))
 print("gold genai rows:", gold_genai.count())
 
 # %% [markdown]
+# ## Gold — mart de anomalías de costo (FinOps, multi-método)
+#
+# Fuente: Silver, ya con los scores/flags de los **tres métodos** (z-score, MAD,
+# p-tiles) más la regla de negocio de costo negativo. El grano es org × servicio ×
+# día y solo entran los grupos con al menos un evento marcado. Las dos columnas de
+# colección resumen la evidencia: `methods` (set) lista qué detectores dispararon y
+# `scores` (map) guarda el score más fuerte por método. `anomaly_score` es el máximo
+# entre métodos, y ordena la tabla de serving para "peores anomalías primero".
+
+# %%
+gold_anomaly = cpa.build_gold_cost_anomaly(silver_g)
+gold_anomaly.write.mode("overwrite").parquet(str(GOLD / "cost_anomaly_by_org_date"))
+gold_anomaly = spark.read.parquet(str(GOLD / "cost_anomaly_by_org_date"))
+print("gold cost-anomaly rows:", gold_anomaly.count())
+
+# %% [markdown]
 # ## Serving — Cassandra (Docker para dev, AstraDB para evidencia final)
 #
 # `serving.connect` es la única abstracción que `SERVING_TARGET` conmuta (contact
-# points de Docker vs secure-connect bundle de AstraDB). Dos tablas query-first se
-# cargan con upserts vía prepared statements (idempotentes por primary key):
-# - `org_daily_usage_by_service` — sirve la consulta #1 (rango de fechas).
-# - `org_service_cost_14d` — sirve la consulta #2 (top-N vía clustering DESC + LIMIT).
+# points de Docker vs secure-connect bundle de AstraDB). Seis tablas query-first se
+# cargan con upserts vía prepared statements (idempotentes por primary key; las
+# tablas cuya PK incluye un score/costo hacen truncate-y-recarga):
+# - `org_daily_usage_by_service` — consulta #1 (rango de fechas).
+# - `org_service_cost_14d` — consulta #2 (top-N vía clustering DESC + LIMIT).
+# - `tickets_by_org_date` — consulta #3 (tickets + SLA por día).
+# - `revenue_by_org_month` — consulta #4 (revenue mensual en USD).
+# - `genai_tokens_by_org_date` — consulta #5 (tokens GenAI por día).
+# - `cost_anomaly_by_org_date` — consulta extra de anomalías (score por método, multi-método).
 
 # %%
 import serving
@@ -417,9 +440,11 @@ n_14d = serving.upsert_cost_14d(session, cost_14d.collect())
 n_tickets = serving.upsert_tickets(session, gold_tickets.collect())
 n_revenue = serving.upsert_revenue(session, gold_revenue.collect())
 n_genai = serving.upsert_genai(session, gold_genai.collect())
+n_anomaly = serving.upsert_cost_anomaly(session, gold_anomaly.collect())
 print(
     f"cassandra rows upserted: {n_daily} daily, {n_14d} rollup-14d, "
-    f"{n_tickets} tickets, {n_revenue} revenue, {n_genai} genai"
+    f"{n_tickets} tickets, {n_revenue} revenue, {n_genai} genai, "
+    f"{n_anomaly} cost-anomaly"
 )
 
 # %% [markdown]
@@ -452,8 +477,16 @@ for row in top_n:
 # ## Consulta de negocio #3 — evolución de tickets críticos + tasa de SLA breach por día (últimos 30 días)
 
 # %%
-tickets_org = gold_tickets.agg(F.first("org_id")).collect()[0][0]
+# Elegimos, para la demo, el org con más tickets dentro de la ventana de 30 días,
+# así la consulta devuelve datos representativos (no un org sin tickets recientes).
 start_30d = as_of_date - datetime.timedelta(days=29)
+tickets_org = (
+    gold_tickets.filter(F.col("event_date") >= F.lit(start_30d))
+    .groupBy("org_id")
+    .agg(F.sum("ticket_count").alias("n"))
+    .orderBy(F.desc("n"))
+    .first()[0]
+)
 q3_rows = serving.query_tickets_by_org(session, tickets_org, start_30d)
 print(f"\nQuery #3 — org={tickets_org}, últimos 30 días ({start_30d}..{as_of_date})  ({len(q3_rows)} rows):")
 for row in q3_rows[:10]:
@@ -489,6 +522,24 @@ for row in q5_rows[:10]:
     print(
         f"  {row.event_date}  tokens={row.total_tokens:>8}  "
         f"cost_usd={row.cost_usd:8.4f}  events={row.event_count}"
+    )
+
+# %% [markdown]
+# ## Consulta extra — top anomalías de costo por org (multi-método)
+#
+# Sobre `cost_anomaly_by_org_date`. `methods` dice qué detectores coincidieron
+# (z-score / MAD / p-tiles / negative) y cada `score_*` cuán fuerte fue ese método.
+# El clustering por `anomaly_score DESC` devuelve las peores anomalías con un LIMIT.
+
+# %%
+anomaly_org = gold_anomaly.agg(F.first("org_id")).collect()[0][0]
+qa_rows = serving.query_top_anomalies(session, anomaly_org, 10)
+print(f"\nQuery anomalías — top {len(qa_rows)} para org={anomaly_org}:")
+for row in qa_rows:
+    print(
+        f"  {row.event_date}  {row.service:<12} score={row.anomaly_score:7.2f}  "
+        f"methods=[{row.methods}]  z={row.score_zscore}  mad={row.score_mad}  "
+        f"ptiles={row.score_ptiles}"
     )
 
 # %% [markdown]
@@ -530,11 +581,13 @@ counts = [
     ("gold/tickets_by_org_date", _parquet_count(GOLD / "tickets_by_org_date")),
     ("gold/revenue_by_org_month", _parquet_count(GOLD / "revenue_by_org_month")),
     ("gold/genai_tokens_by_org_date", _parquet_count(GOLD / "genai_tokens_by_org_date")),
+    ("gold/cost_anomaly_by_org_date", _parquet_count(GOLD / "cost_anomaly_by_org_date")),
     ("cassandra org_daily_usage_by_service", _cass_count(serving.DAILY_TABLE)),
     ("cassandra org_service_cost_14d", _cass_count(serving.COST_14D_TABLE)),
     ("cassandra tickets_by_org_date", _cass_count(serving.TICKETS_TABLE)),
     ("cassandra revenue_by_org_month", _cass_count(serving.REVENUE_TABLE)),
     ("cassandra genai_tokens_by_org_date", _cass_count(serving.GENAI_TABLE)),
+    ("cassandra cost_anomaly_by_org_date", _cass_count(serving.ANOMALY_TABLE)),
 ]
 print("\n=== Idempotency evidence — row counts per zone (identical across re-runs) ===")
 for name, n in counts:
@@ -559,5 +612,5 @@ for zone in (
 cluster.shutdown()
 spark.stop()
 print(
-    "\nPipeline run complete: landing -> Bronze -> Silver -> Gold -> Cassandra -> queries #1–#5 OK"
+    "\nPipeline run complete: landing -> Bronze -> Silver -> Gold -> Cassandra -> queries #1–#5 + anomalías OK"
 )

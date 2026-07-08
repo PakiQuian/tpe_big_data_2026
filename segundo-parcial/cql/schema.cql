@@ -73,3 +73,23 @@ CREATE TABLE IF NOT EXISTS genai_tokens_by_org_date (
     event_count bigint,
     PRIMARY KEY ((org_id), event_date)
 ) WITH CLUSTERING ORDER BY (event_date DESC);
+
+-- Table 6: the FinOps cost_anomaly_mart — flagged cost anomalies per org/service
+-- /day, scored by three methods (z-score, MAD, p-tiles) plus the negative-cost
+-- business rule. `methods` lists the detectors that fired; each score_* column is
+-- that method's strongest score (null when it did not fire). Cluster by
+-- anomaly_score DESC so the worst anomalies for an org surface first.
+CREATE TABLE IF NOT EXISTS cost_anomaly_by_org_date (
+    org_id text,
+    anomaly_score double,
+    event_date date,
+    service text,
+    methods text,
+    score_zscore double,
+    score_mad double,
+    score_ptiles double,
+    score_negative double,
+    event_count bigint,
+    org_name text,
+    PRIMARY KEY ((org_id), anomaly_score, event_date, service)
+) WITH CLUSTERING ORDER BY (anomaly_score DESC, event_date DESC, service ASC);

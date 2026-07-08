@@ -198,6 +198,14 @@ ORG_ENRICH_COLS = ["org_name", "plan_tier", "industry", "hq_region"]
 # Default negative-cost threshold for the DQ flag (rule R2).
 NEG_COST_THRESHOLD = -0.01
 
+# Anomaly-detection thresholds, one per method.
+ZSCORE_THRESHOLD = 3.0  # classic |z| > 3 (assumes roughly-normal spread)
+MAD_THRESHOLD = 3.5     # modified z-score, robust to outliers (Iglewicz & Hoaglin)
+
+# Human-readable names of the anomaly methods, used as keys in the Cassandra
+# ``methods set<text>`` / ``scores map<text,double>`` collections.
+ANOMALY_METHODS = ["zscore", "mad", "ptiles", "negative"]
+
 
 def conform(events: DataFrame) -> DataFrame:
     """Conform v1/v2 events and derive features — no dimensional join.
@@ -256,21 +264,101 @@ def apply_dq_rules(df: DataFrame) -> tuple[DataFrame, DataFrame]:
 def flag_cost_anomalies(
     df: DataFrame, neg_threshold: float = NEG_COST_THRESHOLD
 ) -> DataFrame:
-    """Add ``cost_anomaly_flag``: negative cost (R2) OR per-service p01/p99 outlier."""
-    stats = df.groupBy("service").agg(
-        F.percentile_approx("cost_usd", 0.01).alias("_p01"),
-        F.percentile_approx("cost_usd", 0.99).alias("_p99"),
+    """Score each event for cost anomalies with THREE methods, per service.
+
+    The consigna offers three methods "a elección" (z-score, MAD, p-tiles); we
+    implement all three so the anomaly mart can report *which* methods agreed and
+    *how strong* each signal was — richer than a single flag. A fourth business
+    rule (negative cost, R2) is folded in as its own method.
+
+    Per-service statistics (computed in two aggregation passes so the MAD can use
+    the service median):
+
+    - **zscore**  — ``|x - mean| / std``; flagged above :data:`ZSCORE_THRESHOLD`.
+      Sensitive but distorted by the very outliers it hunts.
+    - **mad**     — modified z ``0.6745 * |x - median| / MAD``; flagged above
+      :data:`MAD_THRESHOLD`. Robust to outliers. Null when ``MAD == 0`` (a
+      degenerate service where the median absolute deviation collapses).
+    - **ptiles**  — outside the per-service ``[p01, p99]`` band. Distribution-free.
+    - **negative**— ``cost_usd_increment < neg_threshold`` (business rule R2).
+
+    Columns added: per-method score (``score_zscore`` / ``score_mad`` /
+    ``score_ptiles`` / ``score_negative``, doubles, null where not applicable),
+    per-method boolean flag (``flag_*``), and the overall ``cost_anomaly_flag``
+    (OR of the four). Scores feed the ``scores`` map collection in Gold.
+    """
+    stats1 = df.groupBy("service").agg(
+        F.mean("cost_usd").alias("_mean"),
+        F.stddev("cost_usd").alias("_std"),
+        F.expr("percentile_approx(cost_usd, 0.5)").alias("_median"),
+        F.expr("percentile_approx(cost_usd, 0.01)").alias("_p01"),
+        F.expr("percentile_approx(cost_usd, 0.99)").alias("_p99"),
     )
-    return (
-        df.join(F.broadcast(stats), on="service", how="left")
+    d = df.join(F.broadcast(stats1), on="service", how="left").withColumn(
+        "_abs_dev", F.abs(F.col("cost_usd") - F.col("_median"))
+    )
+    # Second pass: MAD needs the median of the absolute deviations per service.
+    stats2 = d.groupBy("service").agg(
+        F.expr("percentile_approx(_abs_dev, 0.5)").alias("_mad")
+    )
+    d = d.join(F.broadcast(stats2), on="service", how="left")
+
+    # Per-method scores (null when the method does not apply for that row/service).
+    score_zscore = F.when(
+        F.col("_std") > 0,
+        F.abs(F.col("cost_usd") - F.col("_mean")) / F.col("_std"),
+    )
+    score_mad = F.when(
+        F.col("_mad") > 0,
+        F.lit(0.6745) * F.abs(F.col("cost_usd") - F.col("_median")) / F.col("_mad"),
+    )
+    # p-tiles score = signed distance outside the band (0 when inside).
+    score_ptiles = F.greatest(
+        F.col("cost_usd") - F.col("_p99"),
+        F.col("_p01") - F.col("cost_usd"),
+        F.lit(0.0),
+    )
+    score_negative = F.when(
+        F.col("cost_usd_increment") < F.lit(neg_threshold),
+        F.abs(F.col("cost_usd_increment")),
+    )
+
+    out = (
+        d.withColumn("score_zscore", score_zscore)
+        .withColumn("score_mad", score_mad)
+        .withColumn("score_ptiles", score_ptiles)
+        .withColumn("score_negative", score_negative)
+        .withColumn("flag_zscore", F.col("score_zscore") > F.lit(ZSCORE_THRESHOLD))
+        .withColumn("flag_mad", F.col("score_mad") > F.lit(MAD_THRESHOLD))
         .withColumn(
-            "cost_anomaly_flag",
-            (F.col("cost_usd_increment") < F.lit(neg_threshold))
-            | (F.col("cost_usd") < F.col("_p01"))
-            | (F.col("cost_usd") > F.col("_p99")),
+            "flag_ptiles",
+            (F.col("cost_usd") < F.col("_p01")) | (F.col("cost_usd") > F.col("_p99")),
         )
-        .drop("_p01", "_p99")
+        .withColumn(
+            "flag_negative", F.col("cost_usd_increment") < F.lit(neg_threshold)
+        )
     )
+    # Nulls (degenerate service, non-applicable method) count as "not flagged".
+    flag_cols = ["flag_zscore", "flag_mad", "flag_ptiles", "flag_negative"]
+    for c in flag_cols:
+        out = out.withColumn(c, F.coalesce(F.col(c), F.lit(False)))
+
+    # CONSENSUS rule: cost distributions per service are heavily right-skewed, so
+    # any single statistical method (MAD especially) flags the whole upper tail.
+    # We only call an event an anomaly when at least two of the three statistical
+    # methods agree, OR the negative-cost business rule (R2) fires on its own —
+    # a negative charge is a hard signal, not a statistical guess. This is what
+    # makes running three methods worthwhile: agreement, not union.
+    stat_votes = (
+        F.col("flag_zscore").cast("int")
+        + F.col("flag_mad").cast("int")
+        + F.col("flag_ptiles").cast("int")
+    )
+    out = out.withColumn(
+        "cost_anomaly_flag",
+        (stat_votes >= F.lit(2)) | F.col("flag_negative"),
+    )
+    return out.drop("_mean", "_std", "_median", "_p01", "_p99", "_abs_dev", "_mad")
 
 
 # --------------------------------------------------------------------------- #
@@ -365,6 +453,58 @@ def build_gold_revenue(billing: DataFrame) -> DataFrame:
         F.coalesce(F.col("credits"), F.lit(0.0)).alias("credits"),
         F.coalesce(F.col("taxes"), F.lit(0.0)).alias("taxes"),
         "currency",
+    )
+
+
+def build_gold_cost_anomaly(silver: DataFrame) -> DataFrame:
+    """FinOps mart `cost_anomaly_by_org_date`: grain org × service × day.
+
+    Keeps only the flagged events (the mart *is* the anomalies) and rolls them up
+    per org/service/day. For each detection method it keeps the strongest score
+    seen among the events that method flagged (``score_<method>``, null when the
+    method never fired in the group). ``methods`` is a comma-joined list of the
+    detectors that fired, and ``anomaly_score`` the max across methods — a single
+    sortable number that orders the serving table.
+    """
+    flagged = silver.filter(F.col("cost_anomaly_flag"))
+    agg = flagged.groupBy("org_id", "service", "event_date").agg(
+        *[
+            F.max(F.when(F.col(f"flag_{m}"), F.col(f"score_{m}"))).alias(f"score_{m}")
+            for m in ANOMALY_METHODS
+        ],
+        F.count(F.lit(1)).alias("event_count"),
+        F.first("org_name", ignorenulls=True).alias("org_name"),
+    )
+    # `methods`: comma-joined names of the detectors that fired (score non-null).
+    methods = F.concat_ws(
+        ",",
+        F.array_compact(
+            F.array(
+                *[
+                    F.when(F.col(f"score_{m}").isNotNull(), F.lit(m))
+                    for m in ANOMALY_METHODS
+                ]
+            )
+        ),
+    )
+    return (
+        agg.withColumn("methods", methods)
+        .withColumn(
+            "anomaly_score",
+            F.greatest(
+                *[F.coalesce(F.col(f"score_{m}"), F.lit(0.0)) for m in ANOMALY_METHODS]
+            ),
+        )
+        .select(
+            "org_id",
+            "event_date",
+            "service",
+            "anomaly_score",
+            "methods",
+            *[f"score_{m}" for m in ANOMALY_METHODS],
+            "event_count",
+            "org_name",
+        )
     )
 
 
