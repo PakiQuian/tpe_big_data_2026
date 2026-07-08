@@ -1,0 +1,37 @@
+segundo-parcial/cql/queries.cql
+  s_206f30ecf76b18::t_118e7c8333feb4 22-42
+  s_206f30ecf76b18::t_74208ea6f8a713 1
+segundo-parcial/pipeline.py
+  s_206f30ecf76b18::t_924958ea5ce3b0 13-17
+  s_206f30ecf76b18::t_72b65158827d0b 417-423
+  s_206f30ecf76b18::t_514bae4f493e62 351-392
+  s_206f30ecf76b18::t_8f88ada9b83784 452-493
+  s_206f30ecf76b18::t_d6daa1f6707a3d 528,530-532,535-537
+  s_206f30ecf76b18::t_7cfc3482959e92 562
+segundo-parcial/cql/schema.cql
+  s_206f30ecf76b18::t_9acb620a37c3ae 39-75
+segundo-parcial/serving.py
+  s_206f30ecf76b18::t_4fa9aacd53cc81 137-139
+  s_206f30ecf76b18::t_9a12bc385cb611 20-22
+  s_206f30ecf76b18::t_66accc93689c3c 58-101
+  s_206f30ecf76b18::t_ea75900d33681e 199-265
+  s_206f30ecf76b18::t_8e29152c7b74b6 282-309
+segundo-parcial/cpa.py
+  s_206f30ecf76b18::t_36959ce9899996 321-384
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "0b9282fc8264fe4688213e1ba74507d7d4ef93fa",
+  "prompts": {},
+  "sessions": {
+    "s_206f30ecf76b18": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "588e0d0a-d7c8-4406-9463-92e23bb87a26",
+        "model": "claude-sonnet-4-6"
+      },
+      "human_author": "mperezdegrac_meli <mateo.perezdegracia@mercadolibre.com>"
+    }
+  }
+}
