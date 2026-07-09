@@ -1,0 +1,9 @@
+# AstraDB secure-connect bundle — SECRETO (certificado + claves de la DB).
+# Nunca commitear.
+secure-connect-*.zip
+*secure-connect*.zip
+
+# Credenciales / tokens sueltos
+*.astra.env
+astra.env
+.env

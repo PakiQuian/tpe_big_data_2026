@@ -1,8 +1,8 @@
-# Big Data TP2 — Cloud Provider Analytics
+# Big Data Trabajo Final — Cloud Provider Analytics
 
 **Materia:** Big Data — 72.80
 
-**Fecha de entrega:** 15/06/2026
+**Fecha de entrega:** 13/07/2026
 
 **Integrantes:**
 
@@ -88,7 +88,7 @@ flowchart LR
 ## Estructura del repositorio
 
 ```
-segundo-parcial/
+final/
   pipeline.py        # driver (jupytext percent) — leer de arriba a abajo
   pipeline.ipynb     # notebook generado para Colab
   cpa.py             # puro: registro de esquemas + transformaciones Silver/Gold
@@ -132,7 +132,7 @@ es de dónde toma las credenciales de Astra.
 ### 2a. Correr local con uv
 
 ```bash
-cd segundo-parcial
+cd final
 
 # Entorno Python (uv fija Python 3.12 + instala pyspark, cassandra-driver, ...)
 uv sync
@@ -150,7 +150,7 @@ uv run python pipeline.py
 Abrí `pipeline.ipynb` en Colab y corré de arriba a abajo. La primera celda
 (**Bootstrap de Colab**) se autodetecta y hace todo el setup: clona este repo,
 instala `pyspark` + `cassandra-driver` + un JDK 17, y se posiciona en
-`segundo-parcial/` para que `cpa.py`, `serving.py` y `datalake/landing` queden en
+`final/` para que `cpa.py`, `serving.py` y `datalake/landing` queden en
 rutas relativas. No hace falta nada manual.
 
 La celda **AstraDB en Colab** (justo después del bootstrap) configura el serving
@@ -187,7 +187,7 @@ corre igual contra una Cassandra local en Docker — es el valor por defecto
 (`SERVING_TARGET=docker`).
 
 ```bash
-cd segundo-parcial
+cd final
 uv sync
 
 # Cassandra local

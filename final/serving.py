@@ -149,6 +149,7 @@ def connect(
     else:
         raise ValueError(f"unknown serving target: {target}")
     session.set_keyspace(keyspace)
+    session.default_timeout = 60.0
     return session, cluster
 
 
